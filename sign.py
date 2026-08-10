@@ -4,10 +4,14 @@ import json
 import re
 import requests
 from bs4 import BeautifulSoup
+from requests.exceptions import Timeout, ConnectionError
 
 # ========== 全局配置 ==========
 TIMEOUT = 20
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+HEADERS_BASE = {
+    "User-Agent": USER_AGENT
+}
 
 def log(msg):
     print(f"[签到] {msg}")
@@ -42,12 +46,11 @@ def sign_discuz_paulsign(account):
     cookie = account.get("cookie", "").strip()
 
     session = requests.Session()
-    session.headers.update({
-        "User-Agent": USER_AGENT,
-        "Referer": f"{url}/forum.php"
-    })
+    headers = HEADERS_BASE.copy()
+    headers["Referer"] = f"{url}/forum.php"
     if cookie:
-        session.headers["Cookie"] = cookie
+        headers["Cookie"] = cookie
+    session.headers.update(headers)
 
     try:
         index_resp = session.get(f"{url}/forum.php", timeout=TIMEOUT)
@@ -77,6 +80,10 @@ def sign_discuz_paulsign(account):
             preview = resp.text[:150].replace("\n", " ")
             return False, f"签到返回异常，预览：{preview}"
 
+    except Timeout:
+        return False, "请求访问论坛超时"
+    except ConnectionError:
+        return False, "无法连接论坛服务器"
     except Exception as e:
         return False, f"请求异常：{str(e)}"
 
@@ -89,12 +96,11 @@ def sign_zqlj(account):
     cookie = account.get("cookie", "").strip()
 
     session = requests.Session()
-    session.headers.update({
-        "User-Agent": USER_AGENT,
-        "Referer": f"{url}/plugin.php?id=zqlj_sign"
-    })
+    headers = HEADERS_BASE.copy()
+    headers["Referer"] = f"{url}/plugin.php?id=zqlj_sign"
     if cookie:
-        session.headers["Cookie"] = cookie
+        headers["Cookie"] = cookie
+    session.headers.update(headers)
 
     try:
         sign_page_url = f"{url}/plugin.php?id=zqlj_sign"
@@ -110,8 +116,6 @@ def sign_zqlj(account):
             return False, f"未找到打卡sign参数，页面预览：{preview}"
 
         sign_value = sign_match.group(1)
-
-        # 执行真实打卡请求（GET方式，带动态sign参数）
         real_sign_url = f"{url}/plugin.php?id=zqlj_sign&sign={sign_value}"
         resp = session.get(real_sign_url, timeout=TIMEOUT)
         resp.encoding = resp.apparent_encoding
@@ -126,6 +130,10 @@ def sign_zqlj(account):
             preview = resp.text[:200].replace("\n", " ")
             return False, f"打卡返回异常，预览：{preview}"
 
+    except Timeout:
+        return False, "请求访问论坛超时"
+    except ConnectionError:
+        return False, "无法连接论坛服务器"
     except Exception as e:
         return False, f"请求异常：{str(e)}"
 
@@ -138,12 +146,11 @@ def sign_lwdz(account):
     cookie = account.get("cookie", "").strip()
 
     session = requests.Session()
-    session.headers.update({
-        "User-Agent": USER_AGENT,
-        "Referer": f"{url}/plugin.php?id=lwdz_signin:index"
-    })
+    headers = HEADERS_BASE.copy()
+    headers["Referer"] = f"{url}/plugin.php?id=lwdz_signin:index"
     if cookie:
-        session.headers["Cookie"] = cookie
+        headers["Cookie"] = cookie
+    session.headers.update(headers)
 
     try:
         sign_page_url = f"{url}/plugin.php?id=lwdz_signin:index"
@@ -167,6 +174,10 @@ def sign_lwdz(account):
             preview = resp.text[:150].replace("\n", " ")
             return False, f"签到返回异常，预览：{preview}"
 
+    except Timeout:
+        return False, "请求访问论坛超时"
+    except ConnectionError:
+        return False, "无法连接论坛服务器"
     except Exception as e:
         return False, f"请求异常：{str(e)}"
 
@@ -179,12 +190,11 @@ def sign_k_misign(account):
     cookie = account.get("cookie", "").strip()
 
     session = requests.Session()
-    session.headers.update({
-        "User-Agent": USER_AGENT,
-        "Referer": f"{url}/"
-    })
+    headers = HEADERS_BASE.copy()
+    headers["Referer"] = f"{url}/"
     if cookie:
-        session.headers["Cookie"] = cookie
+        headers["Cookie"] = cookie
+    session.headers.update(headers)
 
     try:
         sign_page_url = f"{url}/k_misign-sign.html"
@@ -212,6 +222,10 @@ def sign_k_misign(account):
             preview = resp.text[:150].replace("\n", " ")
             return False, f"签到返回异常，预览：{preview}"
 
+    except Timeout:
+        return False, "请求访问论坛超时"
+    except ConnectionError:
+        return False, "无法连接论坛服务器"
     except Exception as e:
         return False, f"请求异常：{str(e)}"
 
@@ -222,7 +236,7 @@ def sign_phpwind(account):
     cookie = account.get("cookie", "").strip()
 
     session = requests.Session()
-    session.headers.update({"User-Agent": USER_AGENT})
+    session.headers.update(HEADERS_BASE)
     if cookie:
         session.headers["Cookie"] = cookie
     else:
@@ -242,7 +256,12 @@ def sign_phpwind(account):
 
         if "签到成功" in resp.text or "已签到" in resp.text:
             return True, "签到成功"
-        return False, f"签到失败：{resp.text[:120]}"
+        preview = resp.text[:120].replace("\n", " ")
+        return False, f"签到失败：{preview}"
+    except Timeout:
+        return False, "请求访问论坛超时"
+    except ConnectionError:
+        return False, "无法连接论坛服务器"
     except Exception as e:
         return False, f"请求异常：{str(e)}"
 
@@ -255,12 +274,11 @@ def sign_dc_signin(account):
     cookie = account.get("cookie", "").strip()
 
     session = requests.Session()
-    session.headers.update({
-        "User-Agent": USER_AGENT,
-        "Referer": f"{url}/plugin.php?id=dc_signin:dc_signin"
-    })
+    headers = HEADERS_BASE.copy()
+    headers["Referer"] = f"{url}/plugin.php?id=dc_signin:dc_signin"
     if cookie:
-        session.headers["Cookie"] = cookie
+        headers["Cookie"] = cookie
+    session.headers.update(headers)
 
     try:
         # 1. 访问签到页，提取 formhash 并校验登录状态
@@ -276,29 +294,23 @@ def sign_dc_signin(account):
             preview = page_resp.text[:200].replace("\n", " ")
             return False, f"未获取formhash，页面预览：{preview}"
 
-        # =================== 核心修改区域 ===================
-        # 2. 根据抓包数据，构建真实的 POST 提交请求
+        # 2. 构建真实POST提交请求
         real_sign_url = f"{url}/plugin.php?id=dc_signin:sign"
-        
-        # 从 <form> 标签中提取必须携带的字段
         payload = {
-            "formhash": formhash,        # 必须
-            "signsubmit": "yes",         # 必须，标识提交动作
-            "handlekey": "signin",       # 必须，弹窗处理句柄
-            "emotid": "1",               # 必填（默认为“开心”，避免无表情提交报错）
-            "signpn": "true",            # 按钮值，一并带上
-            "referer": f"{url}/./",      # 原文中携带的 referer 值
-            "content": ""                # 留空，如果想发心情文字可自行填充
+            "formhash": formhash,
+            "signsubmit": "yes",
+            "handlekey": "signin",
+            "emotid": "1",
+            "signpn": "true",
+            "referer": f"{url}/./",
+            "content": ""
         }
 
-        # 发送 POST 请求（这才是真正入库的接口）
         resp = session.post(real_sign_url, data=payload, timeout=TIMEOUT)
-        # ==================================================
-
         resp.encoding = resp.apparent_encoding
         result_text = resp.text
 
-        # 3. 精准判断结果
+        # 3. 判断签到结果
         if any(key in result_text for key in ["签到成功", "恭喜您签到成功", "今日已签到", "您今天已经签到"]):
             return True, "签到成功"
         elif "请勿重复签到" in result_text or "今日已签" in result_text:
@@ -309,9 +321,12 @@ def sign_dc_signin(account):
             preview = result_text[:200].replace("\n", " ")
             return False, f"签到返回异常，预览：{preview}"
 
+    except Timeout:
+        return False, "请求访问论坛超时"
+    except ConnectionError:
+        return False, "无法连接论坛服务器"
     except Exception as e:
         return False, f"请求异常：{str(e)}"
-		
 
 
 def sign_erling_qd(account):
@@ -321,12 +336,13 @@ def sign_erling_qd(account):
     url = account["url"].rstrip("/")
     cookie = account.get("cookie", "").strip()
 
-    session = create_retry_session()
-    session.headers.update(HEADERS_BASE)
+    session = requests.Session()
+    headers = HEADERS_BASE.copy()
     sign_page = f"{url}/erling_qd-sign_in.html"
-    session.headers["Referer"] = sign_page
+    headers["Referer"] = sign_page
     if cookie:
-        session.headers["Cookie"] = cookie
+        headers["Cookie"] = cookie
+    session.headers.update(headers)
 
     try:
         # 1. 访问签到页面，获取formhash并校验登录状态
@@ -357,21 +373,12 @@ def sign_erling_qd(account):
             preview = res_text[:200].replace("\n", " ")
             return False, f"签到返回异常，预览：{preview}"
 
-    except requests.exceptions.Timeout:
-        return False, "请求超时"
-    except requests.exceptions.ConnectionError:
+    except Timeout:
+        return False, "请求访问论坛超时"
+    except ConnectionError:
         return False, "无法连接论坛服务器"
     except Exception as e:
         return False, f"未知异常：{str(e)}"
-
-
-
-
-
-
-
-
-
 
 # ========== 论坛类型映射表 ==========
 FORUM_HANDLERS = {
@@ -381,17 +388,14 @@ FORUM_HANDLERS = {
     "k_misign": sign_k_misign,
     "dc_signin": sign_dc_signin,
     "phpwind": sign_phpwind,
-    # 新增恩山20CMS打卡
     "erling_qd": sign_erling_qd,
 }
-
-
 
 # ========== 主逻辑 ==========
 def main():
     accounts = load_accounts()
     if not accounts:
-        log("没有读取到任何账号配置，请检查 Secrets")
+        log("没有读取到任何账号配置，请检查 Secrets FORUM_ACCOUNTS")
         sys.exit(1)
 
     success = 0
@@ -421,8 +425,8 @@ def main():
             fail += 1
 
     log(f"===== 全部完成：成功 {success} 个，失败 {fail} 个 =====")
-
-    if success == 0 and fail > 0:
+    # 存在失败任务时退出码1，触发GitHub Action告警
+    if fail > 0:
         sys.exit(1)
 
 if __name__ == "__main__":
