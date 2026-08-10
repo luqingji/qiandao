@@ -1,12 +1,13 @@
 import os
 import sys
 import json
+import re
 import requests
 from bs4 import BeautifulSoup
 
 # ========== 全局配置 ==========
-TIMEOUT = 15
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+TIMEOUT = 20
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 
 def log(msg):
     print(f"[签到] {msg}")
@@ -16,84 +17,113 @@ def load_accounts():
     raw = os.environ.get("FORUM_ACCOUNTS", "[]")
     try:
         return json.loads(raw)
-    except json.JSONDecodeError:
-        log("❌ 账号配置解析失败，请检查 Secrets 里的 JSON 格式")
+    except json.JSONDecodeError as e:
+        log(f"❌ 账号配置JSON解析失败：{str(e)}")
         return []
 
-def create_session(account):
-    """创建会话：优先用 Cookie 免登录，否则走账号密码登录
-    返回：(session对象, 是否登录成功)
-    """
-    session = requests.Session()
-    session.headers.update({"User-Agent": USER_AGENT})
-    url = account["url"].rstrip("/")
-
-    # ===== 优先使用 Cookie 模式（绕过登录验证码） =====
-    if "cookie" in account and account["cookie"].strip():
-        session.headers["Cookie"] = account["cookie"].strip()
-        # 简单校验：访问首页看是否包含用户名，确认Cookie有效
-        try:
-            test_resp = session.get(f"{url}/forum.php", timeout=TIMEOUT)
-            # Discuz登录后会显示用户名，这里用是否存在退出链接作为简易判断
-            if "退出" in test_resp.text or "logout" in test_resp.text:
-                return session, True
-            else:
-                return session, False
-        except Exception:
-            return session, False
-
-    # ===== 备选：账号密码登录（有验证码时大概率失败） =====
-    login_url = f"{url}/member.php?mod=logging&action=login&loginsubmit=yes&infloat=yes&lssubmit=yes&inajax=1"
-    login_data = {
-        "username": account.get("username", ""),
-        "password": account.get("password", ""),
-        "quickforward": "yes",
-        "handlekey": "ls"
-    }
-    try:
-        session.post(login_url, data=login_data, timeout=TIMEOUT)
-        # 校验登录状态
-        test_resp = session.get(f"{url}/forum.php", timeout=TIMEOUT)
-        if "退出" in test_resp.text or "logout" in test_resp.text:
-            return session, True
-        else:
-            return session, False
-    except Exception as e:
-        return session, False
+def get_formhash(html):
+    """通用提取formhash，兼容所有Discuz模板和插件"""
+    # 方法1：从input标签提取
+    soup = BeautifulSoup(html, "html.parser")
+    hash_input = soup.find("input", {"name": "formhash"})
+    if hash_input and hash_input.get("value"):
+        return hash_input["value"]
+    # 方法2：从页面JS中正则提取
+    match = re.search(r'formhash\s*=\s*["\']([a-zA-Z0-9]+)["\']', html)
+    if match:
+        return match.group(1)
+    return None
 
 # ========== 各类型签到实现 ==========
 
 def sign_discuz_paulsign(account):
-    """类型: discuz → Discuz! + dsu_paulsign 保罗签到插件
-    适用：bbs.54lee.com、chuanqijishu.com、bbs.gycq.net、wanmirbbs.com 等绝大多数论坛
+    """类型: discuz → Discuz! + dsu_paulsign 保罗签到插件（最通用）
+    适用：bbs.54lee.com、bbs.gycq.net、www.wanmirbbs.com 等多数论坛
     """
     url = account["url"].rstrip("/")
-    session, login_ok = create_session(account)
-    if not login_ok:
-        return False, "登录失效，请检查Cookie是否过期，或账号密码是否正确"
+    cookie = account.get("cookie", "").strip()
 
-    # 获取 formhash
-    index_resp = session.get(f"{url}/forum.php", timeout=TIMEOUT)
-    soup = BeautifulSoup(index_resp.text, "html.parser")
-    hash_input = soup.find("input", {"name": "formhash"})
-    if not hash_input:
-        return False, "未找到 formhash，登录状态异常"
-    formhash = hash_input["value"]
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": USER_AGENT,
+        "Referer": f"{url}/forum.php"
+    })
+    if cookie:
+        session.headers["Cookie"] = cookie
 
-    # 提交签到
-    sign_url = f"{url}/plugin.php?id=dsu_paulsign:sign&operation=qiandao&infloat=1&inajax=1"
-    sign_data = {
-        "formhash": formhash,
-        "qdxq": "kx",
-        "qdmode": 3,
-        "todaysay": "",
-        "fastreply": 0
-    }
-    resp = session.post(sign_url, data=sign_data, timeout=TIMEOUT)
+    try:
+        # 1. 访问首页获取formhash
+        index_resp = session.get(f"{url}/forum.php", timeout=TIMEOUT)
+        index_resp.encoding = index_resp.apparent_encoding
+        formhash = get_formhash(index_resp.text)
 
-    if "签到成功" in resp.text or "已经签到" in resp.text or "您今日已签到" in resp.text:
-        return True, "签到成功"
-    return False, f"签到失败：{resp.text[:120]}"
+        if not formhash:
+            preview = index_resp.text[:200].replace("\n", " ")
+            return False, f"未获取formhash，状态码：{index_resp.status_code}，页面预览：{preview}"
+
+        # 2. 提交签到
+        sign_url = f"{url}/plugin.php?id=dsu_paulsign:sign&operation=qiandao&infloat=1&inajax=1"
+        sign_data = {
+            "formhash": formhash,
+            "qdxq": "kx",
+            "qdmode": 3,
+            "todaysay": "",
+            "fastreply": 0
+        }
+        resp = session.post(sign_url, data=sign_data, timeout=TIMEOUT)
+        resp.encoding = resp.apparent_encoding
+
+        if any(key in resp.text for key in ["签到成功", "已经签到", "您今日已签到", "今日已签"]):
+            return True, "签到成功"
+        elif "请登录后再进行操作" in resp.text or "未登录" in resp.text:
+            return False, "Cookie无效/已过期，请重新抓取"
+        else:
+            preview = resp.text[:150].replace("\n", " ")
+            return False, f"签到返回异常，预览：{preview}"
+
+    except Exception as e:
+        return False, f"请求异常：{str(e)}"
+
+
+def sign_zqlj(account):
+    """类型: zqlj → Discuz! + zqlj_sign 自强励志打卡插件
+    适用：www.chuanqijishu.com（紫龙传奇论坛）
+    """
+    url = account["url"].rstrip("/")
+    cookie = account.get("cookie", "").strip()
+
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": USER_AGENT,
+        "Referer": f"{url}/plugin.php?id=zqlj_sign"
+    })
+    if cookie:
+        session.headers["Cookie"] = cookie
+
+    try:
+        sign_page_url = f"{url}/plugin.php?id=zqlj_sign"
+        page_resp = session.get(sign_page_url, timeout=TIMEOUT)
+        page_resp.encoding = page_resp.apparent_encoding
+        formhash = get_formhash(page_resp.text)
+
+        if not formhash:
+            preview = page_resp.text[:200].replace("\n", " ")
+            return False, f"未获取formhash，状态码：{page_resp.status_code}，页面预览：{preview}"
+
+        sign_data = {"formhash": formhash, "signsubmit": "yes"}
+        resp = session.post(sign_page_url, data=sign_data, timeout=TIMEOUT)
+        resp.encoding = resp.apparent_encoding
+
+        if any(key in resp.text for key in ["打卡成功", "今日已打卡", "已经打卡", "签到成功"]):
+            return True, "打卡成功"
+        elif "请登录" in resp.text or "未登录" in resp.text:
+            return False, "Cookie无效/已过期，请重新抓取"
+        else:
+            preview = resp.text[:150].replace("\n", " ")
+            return False, f"打卡返回异常，预览：{preview}"
+
+    except Exception as e:
+        return False, f"请求异常：{str(e)}"
 
 
 def sign_lwdz(account):
@@ -101,24 +131,40 @@ def sign_lwdz(account):
     适用：bbs.hqbbk.com
     """
     url = account["url"].rstrip("/")
-    session, login_ok = create_session(account)
-    if not login_ok:
-        return False, "登录失效，请检查Cookie是否过期"
+    cookie = account.get("cookie", "").strip()
 
-    sign_page_url = f"{url}/plugin.php?id=lwdz_signin:index"
-    page_resp = session.get(sign_page_url, timeout=TIMEOUT)
-    soup = BeautifulSoup(page_resp.text, "html.parser")
-    hash_input = soup.find("input", {"name": "formhash"})
-    if not hash_input:
-        return False, "未找到 formhash，登录状态异常"
-    formhash = hash_input["value"]
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": USER_AGENT,
+        "Referer": f"{url}/plugin.php?id=lwdz_signin:index"
+    })
+    if cookie:
+        session.headers["Cookie"] = cookie
 
-    sign_data = {"formhash": formhash, "signsubmit": "yes"}
-    resp = session.post(sign_page_url, data=sign_data, timeout=TIMEOUT)
+    try:
+        sign_page_url = f"{url}/plugin.php?id=lwdz_signin:index"
+        page_resp = session.get(sign_page_url, timeout=TIMEOUT)
+        page_resp.encoding = page_resp.apparent_encoding
+        formhash = get_formhash(page_resp.text)
 
-    if "签到成功" in resp.text or "今日已签到" in resp.text or "已经签到" in resp.text:
-        return True, "签到成功"
-    return False, f"签到失败：{resp.text[:120]}"
+        if not formhash:
+            preview = page_resp.text[:200].replace("\n", " ")
+            return False, f"未获取formhash，状态码：{page_resp.status_code}，页面预览：{preview}"
+
+        sign_data = {"formhash": formhash, "signsubmit": "yes"}
+        resp = session.post(sign_page_url, data=sign_data, timeout=TIMEOUT)
+        resp.encoding = resp.apparent_encoding
+
+        if any(key in resp.text for key in ["签到成功", "今日已签到", "已经签到", "您今天已经签到"]):
+            return True, "签到成功"
+        elif "请登录" in resp.text or "未登录" in resp.text:
+            return False, "Cookie无效/已过期，请重新抓取"
+        else:
+            preview = resp.text[:150].replace("\n", " ")
+            return False, f"签到返回异常，预览：{preview}"
+
+    except Exception as e:
+        return False, f"请求异常：{str(e)}"
 
 
 def sign_k_misign(account):
@@ -126,36 +172,56 @@ def sign_k_misign(account):
     适用：www.ruciwan.com
     """
     url = account["url"].rstrip("/")
-    session, login_ok = create_session(account)
-    if not login_ok:
-        return False, "登录失效，请检查Cookie是否过期"
+    cookie = account.get("cookie", "").strip()
 
-    # 伪静态地址，失效可换原生路径：/plugin.php?id=k_misign:sign
-    sign_page_url = f"{url}/k_misign-sign.html"
-    page_resp = session.get(sign_page_url, timeout=TIMEOUT)
-    soup = BeautifulSoup(page_resp.text, "html.parser")
-    hash_input = soup.find("input", {"name": "formhash"})
-    if not hash_input:
-        return False, "未找到 formhash，登录状态异常或插件路径不对"
-    formhash = hash_input["value"]
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": USER_AGENT,
+        "Referer": f"{url}/"
+    })
+    if cookie:
+        session.headers["Cookie"] = cookie
 
-    sign_data = {"formhash": formhash, "signsubmit": "yes"}
-    resp = session.post(sign_page_url, data=sign_data, timeout=TIMEOUT)
+    try:
+        # 伪静态优先，失败自动 fallback 原生路径
+        sign_page_url = f"{url}/k_misign-sign.html"
+        page_resp = session.get(sign_page_url, timeout=TIMEOUT)
+        if page_resp.status_code != 200:
+            sign_page_url = f"{url}/plugin.php?id=k_misign:sign"
+            page_resp = session.get(sign_page_url, timeout=TIMEOUT)
 
-    if "签到成功" in resp.text or "今日已签到" in resp.text or "已经签到" in resp.text:
-        return True, "签到成功"
-    return False, f"签到失败：{resp.text[:120]}"
+        page_resp.encoding = page_resp.apparent_encoding
+        formhash = get_formhash(page_resp.text)
+
+        if not formhash:
+            preview = page_resp.text[:200].replace("\n", " ")
+            return False, f"未获取formhash，状态码：{page_resp.status_code}，页面预览：{preview}"
+
+        sign_data = {"formhash": formhash, "signsubmit": "yes"}
+        resp = session.post(sign_page_url, data=sign_data, timeout=TIMEOUT)
+        resp.encoding = resp.apparent_encoding
+
+        if any(key in resp.text for key in ["签到成功", "今日已签到", "已经签到", "您今天已经签到"]):
+            return True, "签到成功"
+        elif "请登录" in resp.text or "未登录" in resp.text:
+            return False, "Cookie无效/已过期，请重新抓取"
+        else:
+            preview = resp.text[:150].replace("\n", " ")
+            return False, f"签到返回异常，预览：{preview}"
+
+    except Exception as e:
+        return False, f"请求异常：{str(e)}"
 
 
 def sign_phpwind(account):
     """类型: phpwind → PHPWind 论坛程序"""
     url = account["url"].rstrip("/")
+    cookie = account.get("cookie", "").strip()
+
     session = requests.Session()
     session.headers.update({"User-Agent": USER_AGENT})
-
-    # 优先Cookie模式
-    if "cookie" in account and account["cookie"].strip():
-        session.headers["Cookie"] = account["cookie"].strip()
+    if cookie:
+        session.headers["Cookie"] = cookie
     else:
         login_url = f"{url}/login.php?m=login&a=dologin"
         login_data = {
@@ -166,19 +232,24 @@ def sign_phpwind(account):
         }
         session.post(login_url, data=login_data, timeout=TIMEOUT)
 
-    sign_url = f"{url}/index.php?m=sign&a=dosign"
-    resp = session.get(sign_url, timeout=TIMEOUT)
+    try:
+        sign_url = f"{url}/index.php?m=sign&a=dosign"
+        resp = session.get(sign_url, timeout=TIMEOUT)
+        resp.encoding = resp.apparent_encoding
 
-    if "签到成功" in resp.text or "已签到" in resp.text:
-        return True, "签到成功"
-    return False, f"签到失败：{resp.text[:120]}"
+        if "签到成功" in resp.text or "已签到" in resp.text:
+            return True, "签到成功"
+        return False, f"签到失败：{resp.text[:120]}"
+    except Exception as e:
+        return False, f"请求异常：{str(e)}"
 
-# ========== 类型映射表 ==========
+# ========== 论坛类型映射表 ==========
 FORUM_HANDLERS = {
-    "discuz": sign_discuz_paulsign,
-    "lwdz": sign_lwdz,
-    "k_misign": sign_k_misign,
-    "phpwind": sign_phpwind,
+    "discuz": sign_discuz_paulsign,   # 保罗签到（通用默认）
+    "zqlj": sign_zqlj,                # 自强励志打卡（紫龙传奇）
+    "lwdz": sign_lwdz,                # lwdz签到
+    "k_misign": sign_k_misign,        # K签到
+    "phpwind": sign_phpwind,          # PHPWind
 }
 
 # ========== 主逻辑 ==========
