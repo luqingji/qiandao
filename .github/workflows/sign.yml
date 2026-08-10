@@ -2,27 +2,28 @@ name: 论坛自动签到
 
 on:
   schedule:
-    # 北京时间 8:00 = UTC 时间 0:00
+    # 北京时间 8:00 = UTC 0点执行自动签到
     - cron: '0 0 * * *'
-  workflow_dispatch:  # 允许手动触发运行
+  workflow_dispatch:  # 仓库页面支持手动点击触发签到
 
 jobs:
-  sign:
+  sign_task:
     runs-on: ubuntu-latest
     steps:
-      - name: 拉取代码
+      - name: 拉取仓库全部代码
         uses: actions/checkout@v4
 
-      - name: 配置 Python 环境
+      - name: 配置 Python3.11 环境并缓存pip依赖
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
 
-      - name: 安装依赖
+      - name: 安装脚本所需依赖
         run: pip install -r requirements.txt
 
-      - name: 执行签到
+      - name: 执行论坛批量签到脚本
         env:
+          # 读取仓库Secrets里存储的账号JSON配置
           FORUM_ACCOUNTS: ${{ secrets.FORUM_ACCOUNTS }}
         run: python sign.py
