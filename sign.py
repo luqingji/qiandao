@@ -263,37 +263,40 @@ def sign_dc_signin(account):
         session.headers["Cookie"] = cookie
 
     try:
-        # 访问签到页获取formhash
+        # 1. 访问签到页，提取formhash并校验登录状态
         sign_page_url = f"{url}/plugin.php?id=dc_signin:dc_signin"
         page_resp = session.get(sign_page_url, timeout=TIMEOUT)
         page_resp.encoding = page_resp.apparent_encoding
-        formhash = get_formhash(page_resp.text)
 
+        # 先校验登录状态，未登录直接返回
+        if "您尚未登录" in page_resp.text or "无法进行此操作" in page_resp.text:
+            return False, "Cookie无效/已过期，请重新抓取"
+
+        formhash = get_formhash(page_resp.text)
         if not formhash:
-            if "您尚未登录" in page_resp.text or "无法进行此操作" in page_resp.text:
-                return False, "Cookie无效/已过期，请重新抓取"
             preview = page_resp.text[:200].replace("\n", " ")
             return False, f"未获取formhash，页面预览：{preview}"
 
-        # 提交签到请求
-        sign_data = {
-            "formhash": formhash,
-            "signsubmit": "yes"
-        }
-        resp = session.post(sign_page_url, data=sign_data, timeout=TIMEOUT)
+        # 2. 执行真实签到提交（dc_signin 标准接口，GET+formhash 方式）
+        real_sign_url = f"{url}/plugin.php?id=dc_signin:dc_signin&operation=qiandao&formhash={formhash}&inajax=1"
+        resp = session.get(real_sign_url, timeout=TIMEOUT)
         resp.encoding = resp.apparent_encoding
+        result_text = resp.text
 
-        # 判断结果
-        if any(key in resp.text for key in ["签到成功", "今日已签到", "已经签到", "您今天已经签到"]):
+        # 3. 精准判断结果，避免被导航栏"签到"文字误判
+        if any(key in result_text for key in ["签到成功", "恭喜您签到成功", "今日已签到", "您今天已经签到"]):
             return True, "签到成功"
-        elif "请登录" in resp.text or "未登录" in resp.text:
+        elif "请勿重复签到" in result_text or "今日已签" in result_text:
+            return True, "今日已签到，无需重复提交"
+        elif "请登录" in result_text or "未登录" in result_text:
             return False, "Cookie无效/已过期，请重新抓取"
         else:
-            preview = resp.text[:150].replace("\n", " ")
+            preview = result_text[:200].replace("\n", " ")
             return False, f"签到返回异常，预览：{preview}"
 
     except Exception as e:
         return False, f"请求异常：{str(e)}"
+
 
 
 
