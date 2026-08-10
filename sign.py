@@ -474,6 +474,57 @@ def sign_wanmirbbs(account):
         return False, f"签到程序异常：{str(e)}"
 
 
+def sign_diygm(account):
+    """类型: diy → diygm.com 通用dsu_paulsign保罗签到插件
+    论坛地址：https://www.diygm.com
+    """
+    url = account["url"].rstrip("/")
+    cookie = account.get("cookie", "").strip()
+
+    session = requests.Session()
+    headers = HEADERS_BASE.copy()
+    headers["Referer"] = f"{url}/forum.php"
+    if cookie:
+        headers["Cookie"] = cookie
+    session.headers.update(headers)
+
+    try:
+        index_resp = session.get(f"{url}/forum.php", timeout=TIMEOUT)
+        index_resp.encoding = index_resp.apparent_encoding
+        formhash = get_formhash(index_resp.text)
+
+        if not formhash:
+            preview = index_resp.text[:200].replace("\n", " ")
+            return False, f"未获取formhash，状态码：{index_resp.status_code}，页面预览：{preview}"
+
+        sign_url = f"{url}/plugin.php?id=dsu_paulsign&operation=qiandao&infloat=1&inajax=1"
+        sign_data = {
+            "formhash": formhash,
+            "qdxq": "kx",
+            "qdmode": 3,
+            "todaysay": "",
+            "fastreply": 0
+        }
+        resp = session.post(sign_url, data=sign_data, timeout=TIMEOUT)
+        resp.encoding = resp.apparent_encoding
+
+        if any(key in resp.text for key in ["签到成功", "已经签到", "您今日已签到", "今日已签"]):
+            return True, "签到成功"
+        elif "请登录后再进行操作" in resp.text or "未登录" in resp.text:
+            return False, "Cookie无效/已过期，请重新抓取"
+        else:
+            preview = resp.text[:150].replace("\n", " ")
+            return False, f"签到返回异常，预览：{preview}"
+
+    except Timeout:
+        return False, "请求访问论坛超时"
+    except ConnectionError:
+        return False, "无法连接论坛服务器"
+    except Exception as e:
+        return False, f"请求异常：{str(e)}"
+
+
+
 # ========== 论坛类型映射表（新增wanmirbbs映射） ==========
 FORUM_HANDLERS = {
     "discuz": sign_discuz_paulsign,
@@ -483,8 +534,10 @@ FORUM_HANDLERS = {
     "dc_signin": sign_dc_signin,
     "phpwind": sign_phpwind,
     "erling_qd": sign_erling_qd,
-    "wanmirbbs": sign_wanmirbbs, # 新增玩传奇论坛映射
+    "wanmirbbs": sign_wanmirbbs,
+    "diy": sign_diygm, # 新增DIYGM论坛
 }
+
 
 # ========== 主逻辑 ==========
 def main():
