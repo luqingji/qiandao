@@ -311,6 +311,64 @@ def sign_dc_signin(account):
 
     except Exception as e:
         return False, f"请求异常：{str(e)}"
+		
+
+
+def sign_erling_qd(account):
+    """类型: erling_qd → Discuz! 20CMS erling_qd打卡插件（恩山无线论坛right.com.cn）
+    适用：https://www.right.com.cn/forum/erling_qd-sign_in.html
+    """
+    url = account["url"].rstrip("/")
+    cookie = account.get("cookie", "").strip()
+
+    session = create_retry_session()
+    session.headers.update(HEADERS_BASE)
+    sign_page = f"{url}/erling_qd-sign_in.html"
+    session.headers["Referer"] = sign_page
+    if cookie:
+        session.headers["Cookie"] = cookie
+
+    try:
+        # 1. 访问签到页面，获取formhash并校验登录状态
+        page_resp = session.get(sign_page, timeout=TIMEOUT)
+        page_resp.encoding = "utf-8"
+        page_text = page_resp.text
+
+        if "请先登录" in page_text:
+            return False, "Cookie无效/已过期，请重新抓取"
+
+        formhash = get_formhash(page_text)
+        if not formhash:
+            preview = page_text[:200].replace("\n", " ")
+            return False, f"未获取formhash，页面预览：{preview}"
+
+        # 2. 执行签到POST请求
+        sign_api = f"{url}/plugin.php?id=erling_qd:action&action=sign"
+        post_data = {"formhash": formhash}
+        resp = session.post(sign_api, data=post_data, timeout=TIMEOUT)
+        resp.encoding = "utf-8"
+        res_text = resp.text
+
+        if any(key in res_text for key in ["签到成功", "今日已打卡", "您今日已签到"]):
+            return True, "签到成功"
+        elif "已签到" in res_text:
+            return True, "今日已签到，无需重复提交"
+        else:
+            preview = res_text[:200].replace("\n", " ")
+            return False, f"签到返回异常，预览：{preview}"
+
+    except requests.exceptions.Timeout:
+        return False, "请求超时"
+    except requests.exceptions.ConnectionError:
+        return False, "无法连接论坛服务器"
+    except Exception as e:
+        return False, f"未知异常：{str(e)}"
+
+
+
+
+
+
 
 
 
@@ -323,7 +381,10 @@ FORUM_HANDLERS = {
     "k_misign": sign_k_misign,
     "dc_signin": sign_dc_signin,
     "phpwind": sign_phpwind,
+    # 新增恩山20CMS打卡
+    "erling_qd": sign_erling_qd,
 }
+
 
 
 # ========== 主逻辑 ==========
