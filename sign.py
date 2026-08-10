@@ -263,12 +263,11 @@ def sign_dc_signin(account):
         session.headers["Cookie"] = cookie
 
     try:
-        # 1. 访问签到页，提取formhash并校验登录状态
+        # 1. 访问签到页，提取 formhash 并校验登录状态
         sign_page_url = f"{url}/plugin.php?id=dc_signin:dc_signin"
         page_resp = session.get(sign_page_url, timeout=TIMEOUT)
         page_resp.encoding = page_resp.apparent_encoding
 
-        # 先校验登录状态，未登录直接返回
         if "您尚未登录" in page_resp.text or "无法进行此操作" in page_resp.text:
             return False, "Cookie无效/已过期，请重新抓取"
 
@@ -277,13 +276,29 @@ def sign_dc_signin(account):
             preview = page_resp.text[:200].replace("\n", " ")
             return False, f"未获取formhash，页面预览：{preview}"
 
-        # 2. 执行真实签到提交（dc_signin 标准接口，GET+formhash 方式）
-        real_sign_url = f"{url}/plugin.php?id=dc_signin:dc_signin&operation=qiandao&formhash={formhash}&inajax=1"
-        resp = session.get(real_sign_url, timeout=TIMEOUT)
+        # =================== 核心修改区域 ===================
+        # 2. 根据抓包数据，构建真实的 POST 提交请求
+        real_sign_url = f"{url}/plugin.php?id=dc_signin:sign"
+        
+        # 从 <form> 标签中提取必须携带的字段
+        payload = {
+            "formhash": formhash,        # 必须
+            "signsubmit": "yes",         # 必须，标识提交动作
+            "handlekey": "signin",       # 必须，弹窗处理句柄
+            "emotid": "1",               # 必填（默认为“开心”，避免无表情提交报错）
+            "signpn": "true",            # 按钮值，一并带上
+            "referer": f"{url}/./",      # 原文中携带的 referer 值
+            "content": ""                # 留空，如果想发心情文字可自行填充
+        }
+
+        # 发送 POST 请求（这才是真正入库的接口）
+        resp = session.post(real_sign_url, data=payload, timeout=TIMEOUT)
+        # ==================================================
+
         resp.encoding = resp.apparent_encoding
         result_text = resp.text
 
-        # 3. 精准判断结果，避免被导航栏"签到"文字误判
+        # 3. 精准判断结果
         if any(key in result_text for key in ["签到成功", "恭喜您签到成功", "今日已签到", "您今天已经签到"]):
             return True, "签到成功"
         elif "请勿重复签到" in result_text or "今日已签" in result_text:
