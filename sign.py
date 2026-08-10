@@ -23,12 +23,10 @@ def load_accounts():
 
 def get_formhash(html):
     """通用提取formhash，兼容所有Discuz模板和插件"""
-    # 方法1：从input标签提取
     soup = BeautifulSoup(html, "html.parser")
     hash_input = soup.find("input", {"name": "formhash"})
     if hash_input and hash_input.get("value"):
         return hash_input["value"]
-    # 方法2：从页面JS中正则提取
     match = re.search(r'formhash\s*=\s*["\']([a-zA-Z0-9]+)["\']', html)
     if match:
         return match.group(1)
@@ -52,7 +50,6 @@ def sign_discuz_paulsign(account):
         session.headers["Cookie"] = cookie
 
     try:
-        # 1. 访问首页获取formhash
         index_resp = session.get(f"{url}/forum.php", timeout=TIMEOUT)
         index_resp.encoding = index_resp.apparent_encoding
         formhash = get_formhash(index_resp.text)
@@ -61,7 +58,6 @@ def sign_discuz_paulsign(account):
             preview = index_resp.text[:200].replace("\n", " ")
             return False, f"未获取formhash，状态码：{index_resp.status_code}，页面预览：{preview}"
 
-        # 2. 提交签到
         sign_url = f"{url}/plugin.php?id=dsu_paulsign:sign&operation=qiandao&infloat=1&inajax=1"
         sign_data = {
             "formhash": formhash,
@@ -104,22 +100,30 @@ def sign_zqlj(account):
         sign_page_url = f"{url}/plugin.php?id=zqlj_sign"
         page_resp = session.get(sign_page_url, timeout=TIMEOUT)
         page_resp.encoding = page_resp.apparent_encoding
-        formhash = get_formhash(page_resp.text)
 
-        if not formhash:
+        # 提取打卡链接中的动态 sign 参数
+        sign_match = re.search(r'id=zqlj_sign&sign=([a-zA-Z0-9]+)', page_resp.text)
+        if not sign_match:
+            if "您今天已经打过卡了" in page_resp.text or "今日已打卡" in page_resp.text:
+                return True, "今日已打卡，无需重复提交"
             preview = page_resp.text[:200].replace("\n", " ")
-            return False, f"未获取formhash，状态码：{page_resp.status_code}，页面预览：{preview}"
+            return False, f"未找到打卡sign参数，页面预览：{preview}"
 
-        sign_data = {"formhash": formhash, "signsubmit": "yes"}
-        resp = session.post(sign_page_url, data=sign_data, timeout=TIMEOUT)
+        sign_value = sign_match.group(1)
+
+        # 执行真实打卡请求（GET方式，带动态sign参数）
+        real_sign_url = f"{url}/plugin.php?id=zqlj_sign&sign={sign_value}"
+        resp = session.get(real_sign_url, timeout=TIMEOUT)
         resp.encoding = resp.apparent_encoding
 
-        if any(key in resp.text for key in ["打卡成功", "今日已打卡", "已经打卡", "签到成功"]):
+        if "恭喜您，打卡成功" in resp.text or "打卡成功" in resp.text:
             return True, "打卡成功"
+        elif "您今天已经打过卡了" in resp.text or "请勿重复操作" in resp.text:
+            return True, "今日已打卡，无需重复提交"
         elif "请登录" in resp.text or "未登录" in resp.text:
             return False, "Cookie无效/已过期，请重新抓取"
         else:
-            preview = resp.text[:150].replace("\n", " ")
+            preview = resp.text[:200].replace("\n", " ")
             return False, f"打卡返回异常，预览：{preview}"
 
     except Exception as e:
@@ -183,7 +187,6 @@ def sign_k_misign(account):
         session.headers["Cookie"] = cookie
 
     try:
-        # 伪静态优先，失败自动 fallback 原生路径
         sign_page_url = f"{url}/k_misign-sign.html"
         page_resp = session.get(sign_page_url, timeout=TIMEOUT)
         if page_resp.status_code != 200:
@@ -245,11 +248,11 @@ def sign_phpwind(account):
 
 # ========== 论坛类型映射表 ==========
 FORUM_HANDLERS = {
-    "discuz": sign_discuz_paulsign,   # 保罗签到（通用默认）
-    "zqlj": sign_zqlj,                # 自强励志打卡（紫龙传奇）
-    "lwdz": sign_lwdz,                # lwdz签到
-    "k_misign": sign_k_misign,        # K签到
-    "phpwind": sign_phpwind,          # PHPWind
+    "discuz": sign_discuz_paulsign,
+    "zqlj": sign_zqlj,
+    "lwdz": sign_lwdz,
+    "k_misign": sign_k_misign,
+    "phpwind": sign_phpwind,
 }
 
 # ========== 主逻辑 ==========
