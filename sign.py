@@ -246,14 +246,67 @@ def sign_phpwind(account):
     except Exception as e:
         return False, f"请求异常：{str(e)}"
 
+
+def sign_dc_signin(account):
+    """类型: dc_signin → Discuz! + dc_signin 签到插件
+    适用：bbs.54lee.com
+    """
+    url = account["url"].rstrip("/")
+    cookie = account.get("cookie", "").strip()
+
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": USER_AGENT,
+        "Referer": f"{url}/plugin.php?id=dc_signin:dc_signin"
+    })
+    if cookie:
+        session.headers["Cookie"] = cookie
+
+    try:
+        # 访问签到页获取formhash
+        sign_page_url = f"{url}/plugin.php?id=dc_signin:dc_signin"
+        page_resp = session.get(sign_page_url, timeout=TIMEOUT)
+        page_resp.encoding = page_resp.apparent_encoding
+        formhash = get_formhash(page_resp.text)
+
+        if not formhash:
+            if "您尚未登录" in page_resp.text or "无法进行此操作" in page_resp.text:
+                return False, "Cookie无效/已过期，请重新抓取"
+            preview = page_resp.text[:200].replace("\n", " ")
+            return False, f"未获取formhash，页面预览：{preview}"
+
+        # 提交签到请求
+        sign_data = {
+            "formhash": formhash,
+            "signsubmit": "yes"
+        }
+        resp = session.post(sign_page_url, data=sign_data, timeout=TIMEOUT)
+        resp.encoding = resp.apparent_encoding
+
+        # 判断结果
+        if any(key in resp.text for key in ["签到成功", "今日已签到", "已经签到", "您今天已经签到"]):
+            return True, "签到成功"
+        elif "请登录" in resp.text or "未登录" in resp.text:
+            return False, "Cookie无效/已过期，请重新抓取"
+        else:
+            preview = resp.text[:150].replace("\n", " ")
+            return False, f"签到返回异常，预览：{preview}"
+
+    except Exception as e:
+        return False, f"请求异常：{str(e)}"
+
+
+
 # ========== 论坛类型映射表 ==========
 FORUM_HANDLERS = {
     "discuz": sign_discuz_paulsign,
     "zqlj": sign_zqlj,
     "lwdz": sign_lwdz,
     "k_misign": sign_k_misign,
+    "dc_signin": sign_dc_signin,
     "phpwind": sign_phpwind,
 }
+
 
 # ========== 主逻辑 ==========
 def main():
