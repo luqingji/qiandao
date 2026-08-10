@@ -10,6 +10,7 @@ from requests.exceptions import Timeout, ConnectionError, RequestException
 
 # ========== 全局基础配置 ==========
 TIMEOUT = 20
+RETRY_TIMES = 1  # 网络失败重试1次
 # 随机延时区间，防止频繁请求被封
 SLEEP_MIN = 1
 SLEEP_MAX = 3
@@ -17,7 +18,10 @@ USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTM
 HEADERS_BASE = {
     "User-Agent": USER_AGENT,
     "Accept-Language": "zh-CN,zh;q=0.9",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8"
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Accept-Encoding": "gzip, deflate",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache"
 }
 
 # ========== 通用工具函数 ==========
@@ -84,190 +88,198 @@ def build_session(cookie, referer=""):
     session.headers.update(headers)
     return session
 
-# ========== 各论坛签到实现函数（完整保留原逻辑，仅调用公共工具简化代码） ==========
+def is_login_expired(html):
+    """统一判断Cookie是否失效"""
+    expired_keywords = ["请登录", "未登录", "登录/注册", "您尚未登录"]
+    for kw in expired_keywords:
+        if kw in html:
+            return True
+    return False
+
+def get_short_preview(text, length=120):
+    """截断超长页面文本，精简日志"""
+    text = text.replace("\n", "").replace(" ", "")
+    if len(text) > length:
+        return text[:length] + "..."
+    return text
+
+# ========== 带重试封装请求 ==========
+def safe_request(req_func):
+    for i in range(RETRY_TIMES + 1):
+        try:
+            return req_func()
+        except (Timeout, ConnectionError):
+            if i < RETRY_TIMES:
+                log(f"网络异常，第{i+1}次重试...")
+                random_sleep()
+                continue
+            raise
+
+# ========== 各论坛签到实现函数 ==========
 def sign_discuz_paulsign(account):
-    """类型: discuz → Discuz! + dsu_paulsign 保罗签到插件（最通用）
-    适用：bbs.54lee.com、bbs.gycq.net、www.wanmirbbs.com 等多数论坛
-    """
     url = account["url"].rstrip("/")
     cookie = account.get("cookie", "")
     session = build_session(cookie, referer=f"{url}/forum.php")
 
-    try:
-        index_resp = session.get(f"{url}/forum.php", timeout=TIMEOUT)
-        index_resp.encoding = index_resp.apparent_encoding
-        formhash = get_formhash(index_resp.text)
+    def req_index():
+        return session.get(f"{url}/forum.php", timeout=TIMEOUT)
+    index_resp = safe_request(req_index)
+    index_resp.encoding = index_resp.apparent_encoding
+    html = index_resp.text
 
-        if not formhash:
-            preview = index_resp.text[:200].replace("\n", " ")
-            return False, f"未获取formhash，状态码：{index_resp.status_code}，页面预览：{preview}"
+    if is_login_expired(html):
+        return False, "Cookie失效，请重新抓取登录Cookie"
 
-        sign_url = f"{url}/plugin.php?id=dsu_paulsign:sign&operation=qiandao&infloat=1&inajax=1"
-        sign_data = {
-            "formhash": formhash,
-            "qdxq": "kx",
-            "qdmode": 3,
-            "todaysay": "",
-            "fastreply": 0
-        }
-        random_sleep()
-        resp = session.post(sign_url, data=sign_data, timeout=TIMEOUT)
-        resp.encoding = resp.apparent_encoding
+    formhash = get_formhash(html)
+    if not formhash:
+        preview = get_short_preview(html)
+        return False, f"未获取formhash，页面预览：{preview}"
 
-        if any(key in resp.text for key in ["签到成功", "已经签到", "您今日已签到", "今日已签"]):
-            return True, "签到成功"
-        elif "请登录后再进行操作" in resp.text or "未登录" in resp.text:
-            return False, "Cookie无效/已过期，请重新抓取"
-        else:
-            preview = resp.text[:150].replace("\n", " ")
-            return False, f"签到返回异常，预览：{preview}"
+    sign_url = f"{url}/plugin.php?id=dsu_paulsign:sign&operation=qiandao&infloat=1&inajax=1"
+    sign_data = {
+        "formhash": formhash,
+        "qdxq": "kx",
+        "qdmode": 3,
+        "todaysay": "",
+        "fastreply": 0
+    }
+    random_sleep()
+    def req_sign():
+        return session.post(sign_url, data=sign_data, timeout=TIMEOUT)
+    resp = safe_request(req_sign)
+    resp.encoding = resp.apparent_encoding
+    res_text = resp.text
 
-    except RequestException as e:
-        if isinstance(e, Timeout):
-            return False, "请求访问论坛超时"
-        elif isinstance(e, ConnectionError):
-            return False, "无法连接论坛服务器"
-        else:
-            return False, f"请求异常：{str(e)}"
-
+    if "插件不存在或已关闭" in res_text:
+        return False, "论坛签到插件已关闭/卸载"
+    if any(key in res_text for key in ["签到成功", "已经签到", "您今日已签到", "今日已签"]):
+        return True, "签到成功"
+    elif "请登录后再进行操作" in res_text or "未登录" in res_text:
+        return False, "Cookie无效/已过期，请重新抓取"
+    else:
+        preview = get_short_preview(res_text)
+        return False, f"签到返回异常，预览：{preview}"
 
 def sign_zqlj(account):
-    """类型: zqlj → Discuz! + zqlj_sign 自强励志打卡插件
-    适用：www.chuanqijishu.com（紫龙传奇论坛）
-    """
     url = account["url"].rstrip("/")
     cookie = account.get("cookie", "")
     session = build_session(cookie, referer=f"{url}/plugin.php?id=zqlj_sign")
 
-    try:
-        sign_page_url = f"{url}/plugin.php?id=zqlj_sign"
-        page_resp = session.get(sign_page_url, timeout=TIMEOUT)
-        page_resp.encoding = page_resp.apparent_encoding
+    def req_page():
+        return session.get(f"{url}/plugin.php?id=zqlj_sign", timeout=TIMEOUT)
+    page_resp = safe_request(req_page)
+    page_resp.encoding = page_resp.apparent_encoding
+    html = page_resp.text
 
-        # 提取打卡链接中的动态 sign 参数
-        sign_match = re.search(r'id=zqlj_sign&sign=([a-zA-Z0-9]+)', page_resp.text)
-        if not sign_match:
-            if "您今天已经打过卡了" in page_resp.text or "今日已打卡" in page_resp.text:
-                return True, "今日已打卡，无需重复提交"
-            preview = page_resp.text[:200].replace("\n", " ")
-            return False, f"未找到打卡sign参数，页面预览：{preview}"
+    if is_login_expired(html):
+        return False, "Cookie失效，请重新抓取登录Cookie"
 
-        sign_value = sign_match.group(1)
-        real_sign_url = f"{url}/plugin.php?id=zqlj_sign&sign={sign_value}"
-        random_sleep()
-        resp = session.get(real_sign_url, timeout=TIMEOUT)
-        resp.encoding = resp.apparent_encoding
+    if "您今天已经打过卡了" in html or "今日已打卡" in html:
+        return True, "今日已打卡，无需重复提交"
 
-        if "恭喜您，打卡成功" in resp.text or "打卡成功" in resp.text:
-            return True, "打卡成功"
-        elif "您今天已经打过卡了" in resp.text or "请勿重复操作" in resp.text:
-            return True, "今日已打卡，无需重复提交"
-        elif "请登录" in resp.text or "未登录" in resp.text:
-            return False, "Cookie无效/已过期，请重新抓取"
-        else:
-            preview = resp.text[:200].replace("\n", " ")
-            return False, f"打卡返回异常，预览：{preview}"
+    sign_match = re.search(r'id=zqlj_sign&sign=([a-zA-Z0-9]+)', html)
+    if not sign_match:
+        preview = get_short_preview(html)
+        return False, f"未找到打卡sign参数，页面预览：{preview}"
 
-    except RequestException as e:
-        if isinstance(e, Timeout):
-            return False, "请求访问论坛超时"
-        elif isinstance(e, ConnectionError):
-            return False, "无法连接论坛服务器"
-        else:
-            return False, f"请求异常：{str(e)}"
+    sign_value = sign_match.group(1)
+    real_sign_url = f"{url}/plugin.php?id=zqlj_sign&sign={sign_value}"
+    random_sleep()
+    def req_sign():
+        return session.get(real_sign_url, timeout=TIMEOUT)
+    resp = safe_request(req_sign)
+    resp.encoding = resp.apparent_encoding
+    res_text = resp.text
 
+    if "恭喜您，打卡成功" in res_text or "打卡成功" in res_text:
+        return True, "打卡成功"
+    elif "您今天已经打过卡了" in res_text or "请勿重复操作" in res_text:
+        return True, "今日已打卡，无需重复提交"
+    elif "请登录" in res_text or "未登录" in res_text:
+        return False, "Cookie无效/已过期，请重新抓取"
+    else:
+        preview = get_short_preview(res_text)
+        return False, f"打卡返回异常，预览：{preview}"
 
 def sign_lwdz(account):
-    """类型: lwdz → Discuz! + lwdz_signin 签到插件
-    适用：bbs.hqbbk.com
-    """
     url = account["url"].rstrip("/")
     cookie = account.get("cookie", "")
     sign_page_url = f"{url}/plugin.php?id=lwdz_signin:index"
     session = build_session(cookie, referer=sign_page_url)
 
-    try:
-        page_resp = session.get(sign_page_url, timeout=TIMEOUT)
-        page_resp.encoding = page_resp.apparent_encoding
-        formhash = get_formhash(page_resp.text)
+    def req_page():
+        return session.get(sign_page_url, timeout=TIMEOUT)
+    page_resp = safe_request(req_page)
+    page_resp.encoding = page_resp.apparent_encoding
+    html = page_resp.text
 
-        if not formhash:
-            preview = page_resp.text[:200].replace("\n", " ")
-            return False, f"未获取formhash，状态码：{page_resp.status_code}，页面预览：{preview}"
+    if is_login_expired(html):
+        return False, "Cookie失效，请重新抓取登录Cookie"
 
-        sign_data = {"formhash": formhash, "signsubmit": "yes"}
-        random_sleep()
-        resp = session.post(sign_page_url, data=sign_data, timeout=TIMEOUT)
-        resp.encoding = resp.apparent_encoding
+    formhash = get_formhash(html)
+    if not formhash:
+        preview = get_short_preview(html)
+        return False, f"未获取formhash，页面预览：{preview}"
 
-        if any(key in resp.text for key in ["签到成功", "今日已签到", "已经签到", "您今天已经签到"]):
-            return True, "签到成功"
-        elif "请登录" in resp.text or "未登录" in resp.text:
-            return False, "Cookie无效/已过期，请重新抓取"
-        else:
-            preview = resp.text[:150].replace("\n", " ")
-            return False, f"签到返回异常，预览：{preview}"
+    sign_data = {"formhash": formhash, "signsubmit": "yes"}
+    random_sleep()
+    def req_sign():
+        return session.post(sign_page_url, data=sign_data, timeout=TIMEOUT)
+    resp = safe_request(req_sign)
+    resp.encoding = resp.apparent_encoding
+    res_text = resp.text
 
-    except RequestException as e:
-        if isinstance(e, Timeout):
-            return False, "请求访问论坛超时"
-        elif isinstance(e, ConnectionError):
-            return False, "无法连接论坛服务器"
-        else:
-            return False, f"请求异常：{str(e)}"
-
+    if any(key in res_text for key in ["签到成功", "今日已签到", "已经签到", "您今天已经签到"]):
+        return True, "签到成功"
+    elif "请登录" in res_text or "未登录" in res_text:
+        return False, "Cookie无效/已过期，请重新抓取"
+    else:
+        preview = get_short_preview(res_text)
+        return False, f"签到返回异常，预览：{preview}"
 
 def sign_k_misign(account):
-    """类型: k_misign → Discuz! + k_misign (K签到) 插件
-    适用：www.ruciwan.com
-    """
     url = account["url"].rstrip("/")
     cookie = account.get("cookie", "")
     session = build_session(cookie, referer=f"{url}/")
 
-    try:
-        sign_page_url = f"{url}/k_misign-sign.html"
-        page_resp = session.get(sign_page_url, timeout=TIMEOUT)
-        if page_resp.status_code != 200:
-            sign_page_url = f"{url}/plugin.php?id=k_misign:sign"
-            page_resp = session.get(sign_page_url, timeout=TIMEOUT)
+    def req_page():
+        p1 = session.get(f"{url}/k_misign-sign.html", timeout=TIMEOUT)
+        if p1.status_code == 200:
+            return p1
+        return session.get(f"{url}/plugin.php?id=k_misign:sign", timeout=TIMEOUT)
+    page_resp = safe_request(req_page)
+    page_resp.encoding = page_resp.apparent_encoding
+    html = page_resp.text
 
-        page_resp.encoding = page_resp.apparent_encoding
-        formhash = get_formhash(page_resp.text)
+    if is_login_expired(html):
+        return False, "Cookie失效，请重新抓取登录Cookie"
 
-        if not formhash:
-            preview = page_resp.text[:200].replace("\n", " ")
-            return False, f"未获取formhash，状态码：{page_resp.status_code}，页面预览：{preview}"
+    formhash = get_formhash(html)
+    if not formhash:
+        preview = get_short_preview(html)
+        return False, f"未获取formhash，页面预览：{preview}"
 
-        sign_data = {"formhash": formhash, "signsubmit": "yes"}
-        random_sleep()
-        resp = session.post(sign_page_url, data=sign_data, timeout=TIMEOUT)
-        resp.encoding = resp.apparent_encoding
+    sign_data = {"formhash": formhash, "signsubmit": "yes"}
+    random_sleep()
+    def req_sign():
+        return session.post(page_resp.url, data=sign_data, timeout=TIMEOUT)
+    resp = safe_request(req_sign)
+    resp.encoding = resp.apparent_encoding
+    res_text = resp.text
 
-        if any(key in resp.text for key in ["签到成功", "今日已签到", "已经签到", "您今天已经签到"]):
-            return True, "签到成功"
-        elif "请登录" in resp.text or "未登录" in resp.text:
-            return False, "Cookie无效/已过期，请重新抓取"
-        else:
-            preview = resp.text[:150].replace("\n", " ")
-            return False, f"签到返回异常，预览：{preview}"
-
-    except RequestException as e:
-        if isinstance(e, Timeout):
-            return False, "请求访问论坛超时"
-        elif isinstance(e, ConnectionError):
-            return False, "无法连接论坛服务器"
-        else:
-            return False, f"请求异常：{str(e)}"
-
+    if any(key in res_text for key in ["签到成功", "今日已签到", "已经签到", "您今天已经签到"]):
+        return True, "签到成功"
+    elif "请登录" in res_text or "未登录" in res_text:
+        return False, "Cookie无效/已过期，请重新抓取"
+    else:
+        preview = get_short_preview(res_text)
+        return False, f"签到返回异常，预览：{preview}"
 
 def sign_phpwind(account):
-    """类型: phpwind → PHPWind 论坛程序"""
     url = account["url"].rstrip("/")
     cookie = account.get("cookie", "").strip()
     session = build_session(cookie)
 
-    # 无Cookie则账号密码登录
     if not cookie:
         login_url = f"{url}/login.php?m=login&a=dologin"
         login_data = {
@@ -277,267 +289,219 @@ def sign_phpwind(account):
             "step": 2
         }
         random_sleep()
-        session.post(login_url, data=login_data, timeout=TIMEOUT)
+        def req_login():
+            return session.post(login_url, data=login_data, timeout=TIMEOUT)
+        safe_request(req_login)
 
-    try:
-        sign_url = f"{url}/index.php?m=sign&a=dosign"
-        random_sleep()
-        resp = session.get(sign_url, timeout=TIMEOUT)
-        resp.encoding = resp.apparent_encoding
+    def req_sign():
+        return session.get(f"{url}/index.php?m=sign&a=dosign", timeout=TIMEOUT)
+    resp = safe_request(req_sign)
+    resp.encoding = resp.apparent_encoding
+    res_text = resp.text
 
-        if "签到成功" in resp.text or "已签到" in resp.text:
-            return True, "签到成功"
-        preview = resp.text[:120].replace("\n", " ")
-        return False, f"签到失败：{preview}"
-    except RequestException as e:
-        if isinstance(e, Timeout):
-            return False, "请求访问论坛超时"
-        elif isinstance(e, ConnectionError):
-            return False, "无法连接论坛服务器"
-        else:
-            return False, f"请求异常：{str(e)}"
-
+    if "签到成功" in res_text or "已签到" in res_text:
+        return True, "签到成功"
+    preview = get_short_preview(res_text)
+    return False, f"签到失败：{preview}"
 
 def sign_dc_signin(account):
-    """类型: dc_signin → Discuz! + dc_signin 签到插件
-    适用：bbs.54lee.com
-    """
     url = account["url"].rstrip("/")
     cookie = account.get("cookie", "")
     sign_page_url = f"{url}/plugin.php?id=dc_signin:dc_signin"
     session = build_session(cookie, referer=sign_page_url)
 
-    try:
-        # 1. 访问签到页，提取 formhash 并校验登录状态
-        page_resp = session.get(sign_page_url, timeout=TIMEOUT)
-        page_resp.encoding = page_resp.apparent_encoding
+    def req_page():
+        return session.get(sign_page_url, timeout=TIMEOUT)
+    page_resp = safe_request(req_page)
+    page_resp.encoding = page_resp.apparent_encoding
+    html = page_resp.text
 
-        if "您尚未登录" in page_resp.text or "无法进行此操作" in page_resp.text:
-            return False, "Cookie无效/已过期，请重新抓取"
+    if is_login_expired(html):
+        return False, "Cookie失效，请重新抓取登录Cookie"
 
-        formhash = get_formhash(page_resp.text)
-        if not formhash:
-            preview = page_resp.text[:200].replace("\n", " ")
-            return False, f"未获取formhash，页面预览：{preview}"
+    formhash = get_formhash(html)
+    if not formhash:
+        preview = get_short_preview(html)
+        return False, f"未获取formhash，页面预览：{preview}"
 
-        # 2. 构建真实POST提交请求
-        real_sign_url = f"{url}/plugin.php?id=dc_signin:sign"
-        payload = {
-            "formhash": formhash,
-            "signsubmit": "yes",
-            "handlekey": "signin",
-            "emotid": "1",
-            "signpn": "true",
-            "referer": f"{url}/./",
-            "content": ""
-        }
-        random_sleep()
-        resp = session.post(real_sign_url, data=payload, timeout=TIMEOUT)
-        resp.encoding = resp.apparent_encoding
-        result_text = resp.text
+    real_sign_url = f"{url}/plugin.php?id=dc_signin:sign"
+    payload = {
+        "formhash": formhash,
+        "signsubmit": "yes",
+        "handlekey": "signin",
+        "emotid": "1",
+        "signpn": "true",
+        "referer": f"{url}/./",
+        "content": ""
+    }
+    random_sleep()
+    def req_sign():
+        return session.post(real_sign_url, data=payload, timeout=TIMEOUT)
+    resp = safe_request(req_sign)
+    resp.encoding = resp.apparent_encoding
+    res_text = resp.text
 
-        # 3. 判断签到结果
-        if any(key in result_text for key in ["签到成功", "恭喜您签到成功", "今日已签到", "您今天已经签到"]):
-            return True, "签到成功"
-        elif "请勿重复签到" in result_text or "今日已签" in result_text:
-            return True, "今日已签到，无需重复提交"
-        elif "请登录" in result_text or "未登录" in result_text:
-            return False, "Cookie无效/已过期，请重新抓取"
-        else:
-            preview = result_text[:200].replace("\n", " ")
-            return False, f"签到返回异常，预览：{preview}"
-
-    except RequestException as e:
-        if isinstance(e, Timeout):
-            return False, "请求访问论坛超时"
-        elif isinstance(e, ConnectionError):
-            return False, "无法连接论坛服务器"
-        else:
-            return False, f"请求异常：{str(e)}"
-
+    if any(key in res_text for key in ["签到成功", "恭喜您签到成功", "今日已签到", "您今天已经签到"]):
+        return True, "签到成功"
+    elif "请勿重复签到" in res_text or "今日已签" in res_text:
+        return True, "今日已签到，无需重复提交"
+    elif is_login_expired(res_text):
+        return False, "Cookie无效/已过期，请重新抓取"
+    else:
+        preview = get_short_preview(res_text)
+        return False, f"签到返回异常，预览：{preview}"
 
 def sign_erling_qd(account):
-    """类型: erling_qd → Discuz! 20CMS erling_qd打卡插件（恩山无线论坛right.com.cn）
-    适用：https://www.right.com.cn/forum/erling_qd-sign_in.html
-    """
     url = account["url"].rstrip("/")
     cookie = account.get("cookie", "")
     sign_page = f"{url}/erling_qd-sign_in.html"
     session = build_session(cookie, referer=sign_page)
 
+    def req_page():
+        return session.get(sign_page, timeout=TIMEOUT)
+    page_resp = safe_request(req_page)
+    page_resp.encoding = "utf-8"
+    html = page_resp.text
+
+    if "请先登录" in html:
+        return False, "Cookie无效/已过期，请重新抓取"
+    if "已签到" in html:
+        return True, "今日已签到（页面已标记），无需重复提交"
+
+    formhash = get_formhash(html)
+    if not formhash:
+        preview = get_short_preview(html)
+        return False, f"未获取formhash，页面预览：{preview}"
+
+    sign_api = f"{url}/plugin.php?id=erling_qd:action&action=sign"
+    post_data = {"formhash": formhash}
+    random_sleep()
+    def req_sign():
+        return session.post(sign_api, data=post_data, timeout=TIMEOUT)
+    resp = safe_request(req_sign)
+    resp.encoding = "utf-8"
+    res_text = resp.text
+
     try:
-        # 1. 访问签到页面，校验登录+判断是否今日已签到
-        page_resp = session.get(sign_page, timeout=TIMEOUT)
-        page_resp.encoding = "utf-8"
-        page_text = page_resp.text
+        json_data = resp.json()
+        if json_data.get("success") is True:
+            credit = json_data.get("credit", 0)
+            continuous = json_data.get("continuous_days", 0)
+            msg = json_data.get("message", "")
+            return True, f"签到成功！连续{continuous}天，今日积分+{credit}，提示：{msg}"
+        elif json_data.get("success") is False and "已签到" in json_data.get("message", ""):
+            return True, "接口提示今日已签到，无需重复提交"
+    except json.JSONDecodeError:
+        pass
 
-        if "请先登录" in page_text:
-            return False, "Cookie无效/已过期，请重新抓取"
-
-        # 页面直接存在【已签到】文字，说明今天签过，直接返回成功
-        if "已签到" in page_text:
-            return True, "今日已签到（页面已标记），无需重复提交"
-
-        formhash = get_formhash(page_text)
-        if not formhash:
-            preview = page_text[:200].replace("\n", " ")
-            return False, f"未获取formhash，页面预览：{preview}"
-
-        # 2. 执行签到POST请求
-        sign_api = f"{url}/plugin.php?id=erling_qd:action&action=sign"
-        post_data = {"formhash": formhash}
-        random_sleep()
-        resp = session.post(sign_api, data=post_data, timeout=TIMEOUT)
-        resp.encoding = "utf-8"
-        res_text = resp.text
-
-        # 优先解析JSON返回（接口标准返回格式）
-        try:
-            json_data = resp.json()
-            if json_data.get("success") is True:
-                credit = json_data.get("credit", 0)
-                continuous = json_data.get("continuous_days", 0)
-                msg = json_data.get("message", "")
-                return True, f"签到成功！连续{continuous}天，今日积分+{credit}，提示：{msg}"
-            elif json_data.get("success") is False and "已签到" in json_data.get("message", ""):
-                return True, "接口提示今日已签到，无需重复提交"
-        except json.JSONDecodeError:
-            # 解析JSON失败，降级HTML文本匹配
-            pass
-
-        # 兼容普通HTML页面返回
-        if any(key in res_text for key in ["签到成功", "今日已打卡", "您今日已签到"]):
-            return True, "签到成功"
-        elif "已签到" in res_text:
-            return True, "今日已签到，无需重复提交"
-        else:
-            preview = res_text[:200].replace("\n", " ")
-            return False, f"签到返回异常，预览：{preview}"
-
-    except RequestException as e:
-        if isinstance(e, Timeout):
-            return False, "请求访问论坛超时"
-        elif isinstance(e, ConnectionError):
-            return False, "无法连接论坛服务器"
-        else:
-            return False, f"未知异常：{str(e)}"
-
+    if any(key in res_text for key in ["签到成功", "今日已打卡", "您今日已签到"]):
+        return True, "签到成功"
+    elif "已签到" in res_text:
+        return True, "今日已签到，无需重复提交"
+    else:
+        preview = get_short_preview(res_text)
+        return False, f"签到返回异常，预览：{preview}"
 
 def sign_wanmirbbs(account):
-    """类型: wanmirbbs → 玩传奇论坛 wanmirbbs.com 弹窗签到插件
-    首页自动弹出签到弹窗，需选择表情+留言提交，接口返回JSON
-    """
     base_url = account["url"].rstrip("/")
     cookie = account.get("cookie", "")
     session = build_session(cookie, referer=base_url)
 
+    def req_index():
+        return session.get(base_url, timeout=TIMEOUT)
     try:
-        # 1. 访问首页，触发签到弹窗、获取页面formhash
-        index_resp = session.get(base_url, timeout=TIMEOUT)
-        index_resp.encoding = index_resp.apparent_encoding
-        page_text = index_resp.text
+        index_resp = safe_request(req_index)
+    except ConnectionError:
+        return False, "无法连接论坛服务器（域名屏蔽/宕机）"
+    index_resp.encoding = index_resp.apparent_encoding
+    html = index_resp.text
 
-        # 判断登录状态
-        if "登录/注册" in page_text:
-            return False, "Cookie失效，请重新抓取登录Cookie"
-        
-        # 检测今日是否已签到（页面关键词）
-        if "今日已签到" in page_text:
-            return True, "今日已完成签到，无需重复操作"
+    if "登录/注册" in html:
+        return False, "Cookie失效，请重新抓取登录Cookie"
+    if "今日已签到" in html:
+        return True, "今日已完成签到，无需重复操作"
 
-        # 提取表单验证formhash
-        formhash = get_formhash(page_text)
-        if not formhash:
-            preview = page_text[:200].replace("\n", " ")
-            return False, f"页面未获取formhash，预览：{preview}"
+    formhash = get_formhash(html)
+    if not formhash:
+        preview = get_short_preview(html)
+        return False, f"页面未获取formhash，预览：{preview}"
 
-        # 2. 签到提交接口（mpage_signs签到插件）
-        sign_api = f"{base_url}/plugin.php?id=mpage_signs:signs"
-        # 固定参数：表情选第一个开心(1)，留言填默认文字
-        post_data = {
-            "formhash": formhash,
-            "mood": "1",          # 1=开心表情
-            "content": "今日打卡"  # 签到留言
-        }
-        random_sleep()
-        resp = session.post(sign_api, data=post_data, timeout=TIMEOUT)
-        resp.encoding = "utf-8"
+    sign_api = f"{base_url}/plugin.php?id=mpage_signs:signs"
+    post_data = {
+        "formhash": formhash,
+        "mood": "1",
+        "content": "今日打卡"
+    }
+    random_sleep()
+    def req_sign():
+        return session.post(sign_api, data=post_data, timeout=TIMEOUT)
+    resp = safe_request(req_sign)
+    resp.encoding = "utf-8"
+    res_text = resp.text
 
-        # 解析AJAX JSON返回
-        try:
-            res_json = resp.json()
-            code = res_json.get("code")
-            msg = res_json.get("msg", "")
-            if code == 1:
-                credit = res_json.get("credit", 0)
-                return True, f"签到成功！今日积分+{credit}，提示：{msg}"
-            elif code == -1 and "已签到" in msg:
-                return True, f"今日已签到，提示：{msg}"
-            else:
-                return False, f"签到失败，接口提示：{msg}"
-        except json.JSONDecodeError:
-            # JSON解析失败，降级文本匹配
-            if "签到成功" in resp.text:
-                return True, "签到成功"
-            elif "今日已签到" in resp.text:
-                return True, "今日已签到"
-            else:
-                preview = resp.text[:200].replace("\n", " ")
-                return False, f"签到返回异常，预览：{preview}"
-
-    except RequestException as e:
-        if isinstance(e, Timeout):
-            return False, "访问论坛超时"
-        elif isinstance(e, ConnectionError):
-            return False, "无法连接论坛服务器"
+    try:
+        res_json = resp.json()
+        code = res_json.get("code")
+        msg = res_json.get("msg", "")
+        if code == 1:
+            credit = res_json.get("credit", 0)
+            return True, f"签到成功！今日积分+{credit}，提示：{msg}"
+        elif code == -1 and "已签到" in msg:
+            return True, f"今日已签到，提示：{msg}"
         else:
-            return False, f"签到程序异常：{str(e)}"
-
+            return False, f"签到失败，接口提示：{msg}"
+    except json.JSONDecodeError:
+        if "签到成功" in res_text:
+            return True, "签到成功"
+        elif "今日已签到" in res_text:
+            return True, "今日已签到"
+        else:
+            preview = get_short_preview(res_text)
+            return False, f"签到返回异常，预览：{preview}"
 
 def sign_diygm(account):
-    """类型: diy → diygm.com 通用dsu_paulsign保罗签到插件
-    论坛地址：https://www.diygm.com
-    """
     url = account["url"].rstrip("/")
     cookie = account.get("cookie", "")
     session = build_session(cookie, referer=f"{url}/forum.php")
 
-    try:
-        index_resp = session.get(f"{url}/forum.php", timeout=TIMEOUT)
-        index_resp.encoding = index_resp.apparent_encoding
-        formhash = get_formhash(index_resp.text)
+    def req_index():
+        return session.get(f"{url}/forum.php", timeout=TIMEOUT)
+    index_resp = safe_request(req_index)
+    index_resp.encoding = index_resp.apparent_encoding
+    html = index_resp.text
 
-        if not formhash:
-            preview = index_resp.text[:200].replace("\n", " ")
-            return False, f"未获取formhash，状态码：{index_resp.status_code}，页面预览：{preview}"
+    if is_login_expired(html):
+        return False, "Cookie失效，请重新抓取登录Cookie"
 
-        sign_url = f"{url}/plugin.php?id=dsu_paulsign&operation=qiandao&infloat=1&inajax=1"
-        sign_data = {
-            "formhash": formhash,
-            "qdxq": "kx",
-            "qdmode": 3,
-            "todaysay": "",
-            "fastreply": 0
-        }
-        random_sleep()
-        resp = session.post(sign_url, data=sign_data, timeout=TIMEOUT)
-        resp.encoding = resp.apparent_encoding
+    formhash = get_formhash(html)
+    if not formhash:
+        preview = get_short_preview(html)
+        return False, f"未获取formhash，页面预览：{preview}"
 
-        if any(key in resp.text for key in ["签到成功", "已经签到", "您今日已签到", "今日已签"]):
-            return True, "签到成功"
-        elif "请登录后再进行操作" in resp.text or "未登录" in resp.text:
-            return False, "Cookie无效/已过期，请重新抓取"
-        else:
-            preview = resp.text[:150].replace("\n", " ")
-            return False, f"签到返回异常，预览：{preview}"
+    sign_url = f"{url}/plugin.php?id=dsu_paulsign&operation=qiandao&infloat=1&inajax=1"
+    sign_data = {
+        "formhash": formhash,
+        "qdxq": "kx",
+        "qdmode": 3,
+        "todaysay": "",
+        "fastreply": 0
+    }
+    random_sleep()
+    def req_sign():
+        return session.post(sign_url, data=sign_data, timeout=TIMEOUT)
+    resp = safe_request(req_sign)
+    resp.encoding = resp.apparent_encoding
+    res_text = resp.text
 
-    except RequestException as e:
-        if isinstance(e, Timeout):
-            return False, "请求访问论坛超时"
-        elif isinstance(e, ConnectionError):
-            return False, "无法连接论坛服务器"
-        else:
-            return False, f"请求异常：{str(e)}"
+    if "插件不存在或已关闭" in res_text:
+        return False, "论坛签到插件已关闭/卸载"
+    if any(key in res_text for key in ["签到成功", "已经签到", "您今日已签到", "今日已签"]):
+        return True, "签到成功"
+    elif "请登录后再进行操作" in res_text or "未登录" in res_text:
+        return False, "Cookie无效/已过期，请重新抓取"
+    else:
+        preview = get_short_preview(res_text)
+        return False, f"签到返回异常，预览：{preview}"
 
 # ========== 论坛类型映射表 ==========
 FORUM_HANDLERS = {
@@ -554,7 +518,6 @@ FORUM_HANDLERS = {
 
 # ========== 主执行逻辑 ==========
 def main():
-    # 前置依赖校验
     try:
         from bs4 import BeautifulSoup
     except ModuleNotFoundError:
@@ -589,17 +552,23 @@ def main():
             else:
                 log(f"[{forum_name}] ❌ {msg}")
                 fail_count += 1
+        except RequestException as e:
+            if isinstance(e, ConnectionError):
+                log(f"[{forum_name}] ❌ 网络异常：无法连接论坛服务器")
+            elif isinstance(e, Timeout):
+                log(f"[{forum_name}] ❌ 网络异常：访问超时")
+            else:
+                log(f"[{forum_name}] ❌ 请求异常：{str(e)}")
+            fail_count += 1
         except Exception as e:
             log(f"[{forum_name}] ❌ 签到函数全局异常：{str(e)}")
             fail_count += 1
         random_sleep()
 
-    # 签到统计输出
     log(f"===== 签到任务全部结束 =====")
     log(f"✅ 成功总数：{success_count}")
     log(f"❌ 失败总数：{fail_count}")
 
-    # 存在失败账号则退出码1，Action会标记工作流失败告警
     if fail_count > 0:
         log("存在签到失败账号，程序退出码 1")
         sys.exit(1)
