@@ -345,13 +345,17 @@ def sign_erling_qd(account):
     session.headers.update(headers)
 
     try:
-        # 1. 访问签到页面，获取formhash并校验登录状态
+        # 1. 访问签到页面，校验登录+判断是否今日已签到
         page_resp = session.get(sign_page, timeout=TIMEOUT)
         page_resp.encoding = "utf-8"
         page_text = page_resp.text
 
         if "请先登录" in page_text:
             return False, "Cookie无效/已过期，请重新抓取"
+
+        # 页面直接存在【已签到】文字，说明今天签过，直接返回成功
+        if "已签到" in page_text:
+            return True, "今日已签到（页面已标记），无需重复提交"
 
         formhash = get_formhash(page_text)
         if not formhash:
@@ -365,6 +369,21 @@ def sign_erling_qd(account):
         resp.encoding = "utf-8"
         res_text = resp.text
 
+        # 优先解析JSON返回（接口标准返回格式）
+        try:
+            json_data = resp.json()
+            if json_data.get("success") is True:
+                credit = json_data.get("credit", 0)
+                continuous = json_data.get("continuous_days", 0)
+                msg = json_data.get("message", "")
+                return True, f"签到成功！连续{continuous}天，今日积分+{credit}，提示：{msg}"
+            elif json_data.get("success") is False and "已签到" in json_data.get("message", ""):
+                return True, "接口提示今日已签到，无需重复提交"
+        except json.JSONDecodeError:
+            # 解析JSON失败，降级HTML文本匹配
+            pass
+
+        # 兼容普通HTML页面返回
         if any(key in res_text for key in ["签到成功", "今日已打卡", "您今日已签到"]):
             return True, "签到成功"
         elif "已签到" in res_text:
@@ -379,6 +398,7 @@ def sign_erling_qd(account):
         return False, "无法连接论坛服务器"
     except Exception as e:
         return False, f"未知异常：{str(e)}"
+
 
 # ========== 论坛类型映射表 ==========
 FORUM_HANDLERS = {
