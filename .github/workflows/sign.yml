@@ -4,7 +4,7 @@ on:
   schedule:
     # 北京时间 8:00 = UTC 0点执行自动签到
     - cron: '0 0 * * *'
-  workflow_dispatch:  # 仓库页面支持手动点击触发签到
+  workflow_dispatch:
 
 jobs:
   sign_task:
@@ -22,8 +22,11 @@ jobs:
       - name: 安装脚本所需依赖
         run: pip install -r requirements.txt
 
+      # 随机延时0~10分钟，分散访问时间，降低风控
+      - name: 随机等待0-10分钟
+        run: sleep $((RANDOM % 600))
+
       - name: 执行论坛批量签到脚本
         env:
-          # 读取仓库Secrets里存储的账号JSON配置
           FORUM_ACCOUNTS: ${{ secrets.FORUM_ACCOUNTS }}
         run: python sign.py
