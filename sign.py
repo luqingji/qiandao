@@ -400,7 +400,81 @@ def sign_erling_qd(account):
         return False, f"未知异常：{str(e)}"
 
 
-# ========== 论坛类型映射表 ==========
+def sign_wanmirbbs(account):
+    """类型: wanmirbbs → 玩传奇论坛 wanmirbbs.com 弹窗签到插件
+    首页自动弹出签到弹窗，需选择表情+留言提交，接口返回JSON
+    """
+    base_url = account["url"].rstrip("/")
+    cookie = account.get("cookie", "").strip()
+    session = requests.Session()
+    headers = HEADERS_BASE.copy()
+    headers["Referer"] = base_url
+    if cookie:
+        headers["Cookie"] = cookie
+    session.headers.update(headers)
+
+    try:
+        # 1. 访问首页，触发签到弹窗、获取页面formhash
+        index_resp = session.get(base_url, timeout=TIMEOUT)
+        index_resp.encoding = index_resp.apparent_encoding
+        page_text = index_resp.text
+
+        # 判断登录状态
+        if "登录/注册" in page_text:
+            return False, "Cookie失效，请重新抓取登录Cookie"
+        
+        # 检测今日是否已签到（页面关键词）
+        if "今日已签到" in page_text:
+            return True, "今日已完成签到，无需重复操作"
+
+        # 提取表单验证formhash
+        formhash = get_formhash(page_text)
+        if not formhash:
+            preview = page_text[:200].replace("\n", " ")
+            return False, f"页面未获取formhash，预览：{preview}"
+
+        # 2. 签到提交接口（mpage_signs签到插件）
+        sign_api = f"{base_url}/plugin.php?id=mpage_signs:signs"
+        # 固定参数：表情选第一个开心(1)，留言填默认文字
+        post_data = {
+            "formhash": formhash,
+            "mood": "1",          # 1=开心表情
+            "content": "今日打卡"  # 签到留言
+        }
+        resp = session.post(sign_api, data=post_data, timeout=TIMEOUT)
+        resp.encoding = "utf-8"
+
+        # 解析AJAX JSON返回
+        try:
+            res_json = resp.json()
+            code = res_json.get("code")
+            msg = res_json.get("msg", "")
+            if code == 1:
+                credit = res_json.get("credit", 0)
+                return True, f"签到成功！今日积分+{credit}，提示：{msg}"
+            elif code == -1 and "已签到" in msg:
+                return True, f"今日已签到，提示：{msg}"
+            else:
+                return False, f"签到失败，接口提示：{msg}"
+        except json.JSONDecodeError:
+            # JSON解析失败，降级文本匹配
+            if "签到成功" in resp.text:
+                return True, "签到成功"
+            elif "今日已签到" in resp.text:
+                return True, "今日已签到"
+            else:
+                preview = resp.text[:200].replace("\n", " ")
+                return False, f"签到返回异常，预览：{preview}"
+
+    except Timeout:
+        return False, "访问论坛超时"
+    except ConnectionError:
+        return False, "无法连接论坛服务器"
+    except Exception as e:
+        return False, f"签到程序异常：{str(e)}"
+
+
+# ========== 论坛类型映射表（新增wanmirbbs映射） ==========
 FORUM_HANDLERS = {
     "discuz": sign_discuz_paulsign,
     "zqlj": sign_zqlj,
@@ -409,6 +483,7 @@ FORUM_HANDLERS = {
     "dc_signin": sign_dc_signin,
     "phpwind": sign_phpwind,
     "erling_qd": sign_erling_qd,
+    "wanmirbbs": sign_wanmirbbs, # 新增玩传奇论坛映射
 }
 
 # ========== 主逻辑 ==========
