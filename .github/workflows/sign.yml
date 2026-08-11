@@ -30,3 +30,4 @@ jobs:
         env:
           FORUM_ACCOUNTS: ${{ secrets.FORUM_ACCOUNTS }}
         run: python sign.py
+        continue-on-error: true
