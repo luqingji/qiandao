@@ -157,46 +157,74 @@ def sign_discuz_paulsign(account):
         preview = get_short_preview(res_text)
         return False, f"签到返回异常，预览：{preview}"
 
+# ===================== 修复后的 zqlj 打卡函数（解决登录成功不打卡） =====================
 def sign_zqlj(account):
     url = account["url"].rstrip("/")
     cookie = account.get("cookie", "")
-    session = build_session(cookie, referer=f"{url}/plugin.php?id=zqlj_sign")
+    sign_page_url = f"{url}/plugin.php?id=zqlj_sign"
+    session = build_session(cookie, referer=sign_page_url)
 
     def req_page():
-        return session.get(f"{url}/plugin.php?id=zqlj_sign", timeout=TIMEOUT)
+        return session.get(sign_page_url, timeout=TIMEOUT)
     page_resp = safe_request(req_page)
     page_resp.encoding = page_resp.apparent_encoding
     html = page_resp.text
 
+    # Cookie失效检测
     if is_login_expired(html):
         return False, "Cookie失效，请重新抓取登录Cookie"
 
-    if "您今天已经打过卡了" in html or "今日已打卡" in html:
+    # 适配截图页面关键词：今日已打卡
+    repeat_words = ["您今天已经打过卡了", "今日已打卡", "今日已签到", "请勿重复操作", "今天已打卡"]
+    if any(w in html for w in repeat_words):
         return True, "今日已打卡，无需重复提交"
 
-    sign_match = re.search(r'id=zqlj_sign&sign=([a-zA-Z0-9]+)', html)
-    if not sign_match:
+    # 提取打卡页面实时formhash（核心缺失逻辑）
+    page_formhash = get_formhash(html)
+    if not page_formhash:
         preview = get_short_preview(html)
-        return False, f"未找到打卡sign参数，页面预览：{preview}"
+        return False, f"未获取打卡页formhash，页面预览：{preview}"
 
-    sign_value = sign_match.group(1)
-    real_sign_url = f"{url}/plugin.php?id=zqlj_sign&sign={sign_value}"
-    random_sleep()
-    def req_sign():
-        return session.get(real_sign_url, timeout=TIMEOUT)
-    resp = safe_request(req_sign)
-    resp.encoding = resp.apparent_encoding
-    res_text = resp.text
+    # 方式1：优先POST表单提交（当前网站红色「点击打卡」真实交互）
+    form_search = re.search(r'<form action="(plugin\.php\?id=zqlj_sign)"', html)
+    post_success = False
+    if form_search:
+        submit_api = f"{url}/{form_search.group(1)}"
+        post_payload = {
+            "formhash": page_formhash,
+            "signsubmit": "1"
+        }
+        random_sleep()
+        def post_req():
+            return session.post(submit_api, data=post_payload, timeout=TIMEOUT)
+        safe_request(post_req)
+        # 刷新页面验证是否打卡成功
+        check_resp = session.get(sign_page_url, timeout=TIMEOUT)
+        check_html = check_resp.text
+        if any(w in check_html for w in repeat_words):
+            post_success = True
+            return True, "POST表单打卡成功"
 
-    if "恭喜您，打卡成功" in res_text or "打卡成功" in res_text:
-        return True, "打卡成功"
-    elif "您今天已经打过卡了" in res_text or "请勿重复操作" in res_text:
-        return True, "今日已打卡，无需重复提交"
-    elif "请登录" in res_text or "未登录" in res_text:
-        return False, "Cookie无效/已过期，请重新抓取"
-    else:
-        preview = get_short_preview(res_text)
-        return False, f"打卡返回异常，预览：{preview}"
+    # 方式2：旧版GET链接兜底，追加formhash防止拦截
+    sign_param = re.search(r'id=zqlj_sign&sign=([a-zA-Z0-9]+)', html)
+    get_success = False
+    if sign_param:
+        sign_str = sign_param.group(1)
+        get_api = f"{url}/plugin.php?id=zqlj_sign&sign={sign_str}&formhash={page_formhash}"
+        random_sleep()
+        def get_req():
+            return session.get(get_api, timeout=TIMEOUT)
+        safe_request(get_req)
+        # 二次刷新页面校验真实状态
+        check_resp = session.get(sign_page_url, timeout=TIMEOUT)
+        check_html = check_resp.text
+        if any(w in check_html for w in repeat_words):
+            get_success = True
+            return True, "GET链接打卡成功"
+
+    # POST、GET 全部执行后页面仍未标记打卡，判定失败
+    preview = get_short_preview(html)
+    return False, f"POST/GET打卡提交后页面未更新打卡状态，页面预览：{preview}"
 
 def sign_lwdz(account):
     url = account["url"].rstrip("/")
