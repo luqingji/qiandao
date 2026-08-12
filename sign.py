@@ -10,7 +10,7 @@ from requests.exceptions import Timeout, ConnectionError, RequestException
 
 # ========== 全局基础配置 ==========
 TIMEOUT = 20
-RETRY_TIMES = 1  # 网络失败重试1次
+RETRY_TIMES = 1
 SLEEP_MIN = 1
 SLEEP_MAX = 3
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
@@ -20,51 +20,36 @@ HEADERS_BASE = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
     "Accept-Encoding": "gzip, deflate",
     "Cache-Control": "no-cache",
-    "Pragma": "no-cache"
+    "Pragma": "no-cache",
+    "Sec-Ch-Ua": "\"Chromium\";v=\"126\", \"Not=A?Brand\";v=\"99\"",
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": "\"Windows\"",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "same-origin",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1"
 }
 
 # ========== 通用工具函数 ==========
 def log(msg):
     """统一日志输出"""
-    print(f"[签到] {msg}")
+    print(f"***签到*** {msg}")
 
 def random_sleep():
-    """随机间隔休眠，防论坛拦截"""
+    """随机休眠防封禁"""
     sleep_sec = random.uniform(SLEEP_MIN, SLEEP_MAX)
     time.sleep(sleep_sec)
 
-def load_accounts():
-    """
-    加载账号配置，双模式兼容：
-    1. 本地运行：读取同目录 config.json
-    2. GitHub Actions：读取环境变量 FORUM_ACCOUNTS Secrets
-    """
-    local_config_path = "config.json"
-    if os.path.exists(local_config_path):
-        log("本地调试模式：加载 config.json 配置文件")
-        try:
-            with open(local_config_path, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception as e:
-            log(f"❌ 本地config.json读取失败：{str(e)}")
-            return []
-    
-    raw_env = os.environ.get("FORUM_ACCOUNTS", "").strip()
-    if not raw_env:
-        log("❌ 未检测到本地config.json，且环境变量 FORUM_ACCOUNTS 为空！")
-        return []
-    
-    try:
-        account_list = json.loads(raw_env)
-        log(f"GitHub Actions模式：成功读取 {len(account_list)} 个论坛账号")
-        return account_list
-    except json.JSONDecodeError as e:
-        log(f"❌ FORUM_ACCOUNTS JSON格式解析失败：{str(e)}")
-        log("提示：检查Secrets内JSON字符串是否完整、无多余换行、引号匹配")
-        return []
+def get_short_preview(text, length=120):
+    """页面文本精简预览，日志专用"""
+    clean_text = text.replace("\n", "").replace(" ", "")
+    if len(clean_text) > length:
+        return clean_text[:length] + "..."
+    return clean_text
 
 def get_formhash(html):
-    """通用提取formhash，兼容所有Discuz模板和插件"""
+    """通用提取Discuz formhash"""
     soup = BeautifulSoup(html, "html.parser")
     hash_input = soup.find("input", {"name": "formhash"})
     if hash_input and hash_input.get("value"):
@@ -75,7 +60,7 @@ def get_formhash(html):
     return None
 
 def build_session(cookie, referer=""):
-    """统一构建请求Session，减少重复代码"""
+    """创建会话，绑定Cookie与基础请求头"""
     session = requests.Session()
     headers = HEADERS_BASE.copy()
     if referer:
@@ -86,22 +71,15 @@ def build_session(cookie, referer=""):
     return session
 
 def is_login_expired(html):
-    """统一判断Cookie是否失效"""
+    """判断登录态失效关键词"""
     expired_keywords = ["请登录", "未登录", "登录/注册", "您尚未登录"]
     for kw in expired_keywords:
         if kw in html:
             return True
     return False
 
-def get_short_preview(text, length=120):
-    """截断超长页面文本，精简日志"""
-    text = text.replace("\n", "").replace(" ", "")
-    if len(text) > length:
-        return text[:length] + "..."
-    return text
-
-# ========== 带重试封装请求 ==========
 def safe_request(req_func):
+    """请求重试包装"""
     for i in range(RETRY_TIMES + 1):
         try:
             return req_func()
@@ -112,7 +90,46 @@ def safe_request(req_func):
                 continue
             raise
 
-# ========== 各论坛签到实现函数 ==========
+def follow_redirect(session, target_url, max_redirect=3):
+    """循环跟随301/302跳转，全程携带Cookie与请求头"""
+    current_url = target_url
+    for _ in range(max_redirect):
+        resp = session.get(current_url, timeout=TIMEOUT, allow_redirects=False)
+        if resp.status_code in (301, 302):
+            redirect_url = resp.headers.get("Location")
+            if not redirect_url:
+                break
+            current_url = redirect_url
+            random_sleep()
+            continue
+        return resp
+    # 达到最大跳转次数，直接请求最终地址
+    return session.get(current_url, timeout=TIMEOUT)
+
+def load_accounts():
+    """账号加载：本地config.json优先，GitHub Actions读取Secrets"""
+    local_config = "config.json"
+    if os.path.exists(local_config):
+        log("本地调试模式：加载 config.json 配置文件")
+        try:
+            with open(local_config, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            log(f"❌ 本地config.json读取失败：{str(e)}")
+            return []
+    env_data = os.environ.get("FORUM_ACCOUNTS", "").strip()
+    if not env_data:
+        log("❌ 未检测本地config.json，且环境变量 FORUM_ACCOUNTS 为空！")
+        return []
+    try:
+        account_list = json.loads(env_data)
+        log(f"GitHub Actions模式：成功读取 {len(account_list)} 个论坛账号")
+        return account_list
+    except json.JSONDecodeError as e:
+        log(f"❌ FORUM_ACCOUNTS JSON解析失败：{str(e)}")
+        return []
+
+# ========== 各论坛签到逻辑函数 ==========
 def sign_discuz_paulsign(account):
     url = account["url"].rstrip("/")
     cookie = account.get("cookie", "")
@@ -133,7 +150,7 @@ def sign_discuz_paulsign(account):
         return False, f"未获取formhash，页面预览：{preview}"
 
     sign_url = f"{url}/plugin.php?id=dsu_paulsign:sign&operation=qiandao&infloat=1&inajax=1"
-    sign_data = {
+    post_data = {
         "formhash": formhash,
         "qdxq": "kx",
         "qdmode": 3,
@@ -142,14 +159,15 @@ def sign_discuz_paulsign(account):
     }
     random_sleep()
     def req_sign():
-        return session.post(sign_url, data=sign_data, timeout=TIMEOUT)
+        return session.post(sign_url, data=post_data, timeout=TIMEOUT)
     resp = safe_request(req_sign)
     resp.encoding = resp.apparent_encoding
     res_text = resp.text
 
     if "插件不存在或已关闭" in res_text:
         return False, "论坛签到插件已关闭/卸载"
-    if any(key in res_text for key in ["签到成功", "已经签到", "您今日已签到", "今日已签"]):
+    success_words = ["签到成功", "已经签到", "您今日已签到", "今日已签"]
+    if any(w in res_text for w in success_words):
         return True, "签到成功"
     elif "请登录后再进行操作" in res_text or "未登录" in res_text:
         return False, "Cookie无效/已过期，请重新抓取"
@@ -157,80 +175,66 @@ def sign_discuz_paulsign(account):
         preview = get_short_preview(res_text)
         return False, f"签到返回异常，预览：{preview}"
 
-# ===================== 修复后的 zqlj 打卡函数（解决登录成功不打卡） =====================
 def sign_zqlj(account):
+    """zqlj打卡插件（修复302跳转空白、formhash丢失、二次页面校验）"""
     url = account["url"].rstrip("/")
     cookie = account.get("cookie", "")
     sign_page_url = f"{url}/plugin.php?id=zqlj_sign"
-    session = build_session(cookie, referer=sign_page_url)
+    session = build_session(cookie, referer=f"{url}/forum.php")
 
-    def req_page():
-        return session.get(sign_page_url, timeout=TIMEOUT)
-    page_resp = safe_request(req_page)
+    page_resp = follow_redirect(session, sign_page_url)
     page_resp.encoding = page_resp.apparent_encoding
     html = page_resp.text
 
-    # Cookie失效检测
     if is_login_expired(html):
         return False, "Cookie失效，请重新抓取登录Cookie"
 
-    # 适配截图页面关键词：今日已打卡
     repeat_words = ["您今天已经打过卡了", "今日已打卡", "今日已签到", "请勿重复操作", "今天已打卡"]
     if any(w in html for w in repeat_words):
         return True, "今日已打卡，无需重复提交"
 
-    # 提取打卡页面实时formhash（核心缺失逻辑）
     page_formhash = get_formhash(html)
     if not page_formhash:
         preview = get_short_preview(html)
-        return False, f"未获取打卡页formhash，页面预览：{preview}"
+        return False, f"跳转后页面仍未获取formhash，页面预览：{preview}"
 
-    # 方式1：优先POST表单提交（当前网站红色「点击打卡」真实交互）
-    form_search = re.search(r'<form action="(plugin\.php\?id=zqlj_sign)"', html)
-    post_success = False
-    if form_search:
-        submit_api = f"{url}/{form_search.group(1)}"
-        post_payload = {
-            "formhash": page_formhash,
-            "signsubmit": "1"
-        }
+    # POST表单提交（页面按钮原生请求）
+    form_match = re.search(r'<form action="(plugin\.php\?id=zqlj_sign)"', html)
+    if form_match:
+        submit_api = f"{url}/{form_match.group(1)}"
+        post_payload = {"formhash": page_formhash, "signsubmit": "1"}
         random_sleep()
         def post_req():
             return session.post(submit_api, data=post_payload, timeout=TIMEOUT)
         safe_request(post_req)
-        # 刷新页面验证是否打卡成功
-        check_resp = session.get(sign_page_url, timeout=TIMEOUT)
+        # 刷新页面校验是否打卡成功
+        check_resp = follow_redirect(session, sign_page_url)
         check_html = check_resp.text
         if any(w in check_html for w in repeat_words):
-            post_success = True
             return True, "POST表单打卡成功"
 
-    # 方式2：旧版GET链接兜底，追加formhash防止拦截
-    sign_param = re.search(r'id=zqlj_sign&sign=([a-zA-Z0-9]+)', html)
-    get_success = False
-    if sign_param:
-        sign_str = sign_param.group(1)
+    # GET链接兜底兼容旧版页面
+    sign_param_match = re.search(r'id=zqlj_sign&sign=([a-zA-Z0-9]+)', html)
+    if sign_param_match:
+        sign_str = sign_param_match.group(1)
         get_api = f"{url}/plugin.php?id=zqlj_sign&sign={sign_str}&formhash={page_formhash}"
         random_sleep()
         def get_req():
             return session.get(get_api, timeout=TIMEOUT)
         safe_request(get_req)
-        # 二次刷新页面校验真实状态
-        check_resp = session.get(sign_page_url, timeout=TIMEOUT)
+        check_resp = follow_redirect(session, sign_page_url)
         check_html = check_resp.text
         if any(w in check_html for w in repeat_words):
-            get_success = True
             return True, "GET链接打卡成功"
 
-    # POST、GET 全部执行后页面仍未标记打卡，判定失败
     preview = get_short_preview(html)
-    return False, f"POST/GET打卡提交后页面未更新打卡状态，页面预览：{preview}"
+    return False, f"POST/GET提交后页面未更新打卡状态，页面预览：{preview}"
 
 def sign_lwdz(account):
     url = account["url"].rstrip("/")
     cookie = account.get("cookie", "")
     sign_page_url = f"{url}/plugin.php?id=lwdz_signin:index"
-    session = build_session(cookie, referer=sign_page_url)
+    session = build_session(cookie, referer=f"{url}/forum.php")
 
     def req_page():
         return session.get(sign_page_url, timeout=TIMEOUT)
@@ -246,15 +250,16 @@ def sign_lwdz(account):
         preview = get_short_preview(html)
         return False, f"未获取formhash，页面预览：{preview}"
 
-    sign_data = {"formhash": formhash, "signsubmit": "yes"}
+    post_data = {"formhash": formhash, "signsubmit": "yes"}
     random_sleep()
     def req_sign():
-        return session.post(sign_page_url, data=sign_data, timeout=TIMEOUT)
+        return session.post(sign_page_url, data=post_data, timeout=TIMEOUT)
     resp = safe_request(req_sign)
     resp.encoding = resp.apparent_encoding
     res_text = resp.text
 
-    if any(key in res_text for key in ["签到成功", "今日已签到", "已经签到", "您今天已经签到"]):
+    success_words = ["签到成功", "今日已签到", "已经签到", "您今天已经签到"]
+    if any(w in res_text for w in success_words):
         return True, "签到成功"
     elif "请登录" in res_text or "未登录" in res_text:
         return False, "Cookie无效/已过期，请重新抓取"
@@ -284,15 +289,16 @@ def sign_k_misign(account):
         preview = get_short_preview(html)
         return False, f"未获取formhash，页面预览：{preview}"
 
-    sign_data = {"formhash": formhash, "signsubmit": "yes"}
+    post_data = {"formhash": formhash, "signsubmit": "yes"}
     random_sleep()
     def req_sign():
-        return session.post(page_resp.url, data=sign_data, timeout=TIMEOUT)
+        return session.post(page_resp.url, data=post_data, timeout=TIMEOUT)
     resp = safe_request(req_sign)
     resp.encoding = resp.apparent_encoding
     res_text = resp.text
 
-    if any(key in res_text for key in ["签到成功", "今日已签到", "已经签到", "您今天已经签到"]):
+    success_words = ["签到成功", "今日已签到", "已经签到", "您今天已经签到"]
+    if any(w in res_text for w in success_words):
         return True, "签到成功"
     elif "请登录" in res_text or "未登录" in res_text:
         return False, "Cookie无效/已过期，请重新抓取"
@@ -330,7 +336,7 @@ def sign_phpwind(account):
     return False, f"签到失败：{preview}"
 
 def sign_dc_signin(account):
-    """DC签到通用函数（54lee论坛共用）"""
+    """DC通用签到插件（54lee等论坛）"""
     url = account["url"].rstrip("/")
     cookie = account.get("cookie", "")
     sign_page_url = f"{url}/plugin.php?id=dc_signin:dc_signin"
@@ -350,7 +356,7 @@ def sign_dc_signin(account):
         preview = get_short_preview(html)
         return False, f"未获取formhash，页面预览：{preview}"
 
-    real_sign_url = f"{url}/plugin.php?id=dc_signin:sign"
+    submit_url = f"{url}/plugin.php?id=dc_signin:sign"
     payload = {
         "formhash": formhash,
         "signsubmit": "yes",
@@ -362,17 +368,14 @@ def sign_dc_signin(account):
     }
     random_sleep()
     def req_sign():
-        return session.post(real_sign_url, data=payload, timeout=TIMEOUT)
+        return session.post(submit_url, data=payload, timeout=TIMEOUT)
     resp = safe_request(req_sign)
     resp.encoding = resp.apparent_encoding
     res_text = resp.text
 
-    # 扩充完整重复签到关键词，解决当日签到跳转首页误判失败
-    success_words = ["签到成功", "恭喜您签到成功", "今日已签到", "您今天已经签到",
-                     "请勿重复签到", "今日已签", "今天已签到", "已完成今日签到"]
-    if any(key in res_text for key in success_words):
+    success_words = ["签到成功", "恭喜您签到成功", "今日已签到", "您今天已经签到", "请勿重复签到", "今日已签", "今天已签到", "已完成今日签到"]
+    if any(w in res_text for w in success_words):
         return True, "今日已签到，无需重复提交"
-    # 兼容签到后直接返回首页完整HTML场景
     elif "签到" in html and ("今日打卡" in html or "已签到" in html):
         return True, "页面检测今日已签到，无需重复提交"
     elif is_login_expired(res_text):
@@ -382,18 +385,17 @@ def sign_dc_signin(account):
         return False, f"签到返回异常，预览：{preview}"
 
 def sign_erling_qd(account):
+    """恩山erling_qd签到插件，修复跳转丢失登录态、二次页面校验"""
     url = account["url"].rstrip("/")
     cookie = account.get("cookie", "")
     sign_page = f"{url}/erling_qd-sign_in.html"
-    session = build_session(cookie, referer=sign_page)
+    session = build_session(cookie, referer=f"{url}/forum.php")
 
-    def req_page():
-        return session.get(sign_page, timeout=TIMEOUT)
-    page_resp = safe_request(req_page)
+    page_resp = follow_redirect(session, sign_page)
     page_resp.encoding = "utf-8"
     html = page_resp.text
 
-    if "请先登录" in html:
+    if "请先登录" in html or is_login_expired(html):
         return False, "Cookie无效/已过期，请重新抓取"
     if "已签到" in html:
         return True, "今日已签到（页面已标记），无需重复提交"
@@ -401,13 +403,13 @@ def sign_erling_qd(account):
     formhash = get_formhash(html)
     if not formhash:
         preview = get_short_preview(html)
-        return False, f"未获取formhash，页面预览：{preview}"
+        return False, f"跳转页面无formhash，页面预览：{preview}"
 
-    sign_api = f"{url}/plugin.php?id=erling_qd:action&action=sign"
+    api_url = f"{url}/plugin.php?id=erling_qd:action&action=sign"
     post_data = {"formhash": formhash}
     random_sleep()
     def req_sign():
-        return session.post(sign_api, data=post_data, timeout=TIMEOUT)
+        return session.post(api_url, data=post_data, timeout=TIMEOUT)
     resp = safe_request(req_sign)
     resp.encoding = "utf-8"
     res_text = resp.text
@@ -424,16 +426,18 @@ def sign_erling_qd(account):
     except json.JSONDecodeError:
         pass
 
-    if any(key in res_text for key in ["签到成功", "今日已打卡", "您今日已签到"]):
+    # 提交后刷新页面确认最终状态
+    final_check_resp = follow_redirect(session, sign_page)
+    final_html = final_check_resp.text
+    final_success = ["签到成功", "今日已打卡", "您今日已签到", "已签到"]
+    if any(w in final_html for w in final_success):
         return True, "签到成功"
-    elif "已签到" in res_text:
-        return True, "今日已签到，无需重复提交"
     else:
         preview = get_short_preview(res_text)
-        return False, f"签到返回异常，预览：{preview}"
+        return False, f"签到提交后页面无成功标记，预览：{preview}"
 
 def sign_diygm(account):
-    """DIYGM论坛专用DC签到，匹配截图弹窗：开心表情+默认留言"""
+    """DIYGM专用DC签到，固定留言+表情"""
     url = account["url"].rstrip("/")
     cookie = account.get("cookie", "")
     sign_page_url = f"{url}/plugin.php?id=dc_signin:dc_signin"
@@ -453,8 +457,7 @@ def sign_diygm(account):
         preview = get_short_preview(html)
         return False, f"未获取formhash，页面预览：{preview}"
 
-    real_sign_url = f"{url}/plugin.php?id=dc_signin:sign"
-    # 匹配截图：emotid=1 开心表情、默认留言文字
+    submit_url = f"{url}/plugin.php?id=dc_signin:sign"
     payload = {
         "formhash": formhash,
         "signsubmit": "yes",
@@ -466,14 +469,13 @@ def sign_diygm(account):
     }
     random_sleep()
     def req_sign():
-        return session.post(real_sign_url, data=payload, timeout=TIMEOUT)
+        return session.post(submit_url, data=payload, timeout=TIMEOUT)
     resp = safe_request(req_sign)
     resp.encoding = resp.apparent_encoding
     res_text = resp.text
 
-    success_words = ["签到成功", "恭喜您签到成功", "今日已签到", "您今天已经签到",
-                     "请勿重复签到", "今日已签", "今天已签到", "已完成今日签到"]
-    if any(key in res_text for key in success_words):
+    success_words = ["签到成功", "恭喜您签到成功", "今日已签到", "您今天已经签到", "请勿重复签到", "今日已签", "今天已签到", "已完成今日签到"]
+    if any(w in res_text for w in success_words):
         return True, "今日已签到，无需重复提交"
     elif "签到" in html and ("今日打卡" in html or "已签到" in html):
         return True, "页面检测今日已签到，无需重复提交"
@@ -483,8 +485,8 @@ def sign_diygm(account):
         preview = get_short_preview(res_text)
         return False, f"签到返回异常，预览：{preview}"
 
-# ========== 论坛类型映射表（已删除wanmirbbs废弃条目） ==========
-FORUM_HANDLERS = {
+# ========== 签到类型映射表 ==========
+FORUM_HANDLER_MAP = {
     "discuz": sign_discuz_paulsign,
     "zqlj": sign_zqlj,
     "lwdz": sign_lwdz,
@@ -495,64 +497,55 @@ FORUM_HANDLERS = {
     "diy": sign_diygm,
 }
 
-# ========== 主执行逻辑 ==========
+# ========== 主程序入口 ==========
 def main():
     try:
         from bs4 import BeautifulSoup
     except ModuleNotFoundError:
-        log("❌ 缺少依赖库 beautifulsoup4，请执行：pip install requests beautifulsoup4")
+        log("❌ 缺少依赖库 beautifulsoup4，执行安装：pip install requests beautifulsoup4")
         sys.exit(1)
 
-    accounts = load_accounts()
-    if not accounts:
-        log("没有读取到任何账号配置，请检查 config.json 或 Secrets FORUM_ACCOUNTS")
+    account_list = load_accounts()
+    if not account_list:
+        log("无可用签到账号，程序退出")
         sys.exit(1)
 
-    success_count = 0
-    fail_count = 0
+    success_total = 0
+    fail_total = 0
+    log(f"===== 开始批量签到，共 {len(account_list)} 个论坛账号 =====")
 
-    log(f"===== 开始批量签到，共 {len(accounts)} 个论坛账号 =====")
-    for idx, acc in enumerate(accounts, 1):
-        forum_type = acc.get("type", "discuz")
-        forum_name = acc.get("name", f"未知论坛{idx}")
-        handler_func = FORUM_HANDLERS.get(forum_type)
+    for account in account_list:
+        forum_name = account.get("name", "未知论坛")
+        forum_type = account.get("type", "discuz")
+        log(f"{forum_name} 正在执行签到...")
 
+        handler_func = FORUM_HANDLER_MAP.get(forum_type)
         if not handler_func:
-            log(f"[{forum_name}] ❌ 不支持的论坛类型：{forum_type}")
-            fail_count += 1
+            log(f"❌ {forum_name} 不存在对应签到处理函数，类型：{forum_type}")
+            fail_total += 1
             continue
 
-        log(f"[{forum_name}] 正在执行签到...")
         try:
-            ok, msg = handler_func(acc)
+            ok, msg = handler_func(account)
             if ok:
-                log(f"[{forum_name}] ✅ {msg}")
-                success_count += 1
+                log(f"✅ {msg}")
+                success_total += 1
             else:
-                log(f"[{forum_name}] ❌ {msg}")
-                fail_count += 1
+                log(f"❌ {msg}")
+                fail_total += 1
         except RequestException as e:
-            if isinstance(e, ConnectionError):
-                log(f"[{forum_name}] ❌ 网络异常：无法连接论坛服务器")
-            elif isinstance(e, Timeout):
-                log(f"[{forum_name}] ❌ 网络异常：访问超时")
-            else:
-                log(f"[{forum_name}] ❌ 请求异常：{str(e)}")
-            fail_count += 1
+            log(f"❌ {forum_name} 网络请求异常：{str(e)}")
+            fail_total += 1
         except Exception as e:
-            log(f"[{forum_name}] ❌ 签到函数全局异常：{str(e)}")
-            fail_count += 1
+            log(f"❌ {forum_name} 程序未知异常：{str(e)}")
+            fail_total += 1
         random_sleep()
 
     log(f"===== 签到任务全部结束 =====")
-    log(f"✅ 成功总数：{success_count}")
-    log(f"❌ 失败总数：{fail_count}")
-
-    # 核心修改：无论是否存在失败账号，均返回退出码0，GitHub Action不会标红报错
-    if fail_count > 0:
+    log(f"✅ 成功总数：{success_total}")
+    log(f"❌ 失败总数：{fail_total}")
+    if fail_total > 0:
         log("存在签到失败账号，仅记录日志，不终止任务")
-    else:
-        log("全部账号签到正常")
     sys.exit(0)
 
 if __name__ == "__main__":
